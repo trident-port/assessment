@@ -33,6 +33,7 @@ Options that do more are **off unless you ask**:
 | Option | What it adds |
 |---|---|
 | `--probe-pull` | Creates one throwaway pod, `tp-pull-probe`, to test an image pull, then deletes it. This is the only option of `tp-pre.sh` that creates an object. |
+| `--probe-image IMAGE` | Used with `--probe-pull`. The throwaway pod runs `IMAGE` (`<registry>/<image>:<tag>`) instead of the default `alpine:3.19`, so the test uses an image your own registry serves. It can also be set with `TP_PROBE_IMAGE`. On its own it adds nothing. |
 | `--count-files` | Counts files per claim with a bounded read-only `find`, run with `kubectl exec` in the pod that already mounts the claim. |
 | `--bench` | Measures copy speed and adds the migration-time tables to the summary. **It creates things**: a temporary namespace `tp-bench` with small volumes in your source classes and in the destination class, and runs a few pods in it. It deletes all of it by name when it ends, also when you interrupt it. Needs `--dest-sc <class>`. Read `BENCH.md` first. |
 | `--node-debug` | OpenShift only: reads a node through a temporary `oc debug node` pod, which `oc` removes on exit. |
@@ -90,6 +91,7 @@ check what leaves.
 --no-internal          do not print the last section on the terminal
 --count-files          also count files per claim
 --probe-pull           also test an image pull (creates and deletes one pod)
+--probe-image IMAGE    with --probe-pull, test with this image (default alpine:3.19)
 --read-timeout N       seconds allowed to each batch read (default 300)
 --node-debug           oc only: read nodes through a temporary debug pod
 --bench                also measure copy speed and estimate times (CREATES a
