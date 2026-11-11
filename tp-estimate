@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""tp-estimate: how long would the migration take, from numbers measured here.
+
+Reads two files and nothing else:
+
+  tp-pre-<context>-<date>.json     what is in the cluster (tp-pre.sh)
+  tp-bench-<context>-<date>.json   how fast a copy runs here (tp-bench.sh --bench)
+
+and writes tables of copy times per volume, per namespace and for the whole
+cluster. Only the Python standard library is needed. It runs on the jump host,
+beside the two files, with no product installed. It never contacts a cluster.
+
+    python3 tp-estimate --assessment tp-pre-X.json --bench tp-bench-X.json
+
+THE MODEL. The time of one volume is two measured numbers, not one:
+
+    seconds = bytes / (bytes per second)  +  files * (seconds per file)
+
+The first number comes from the large-file profile, where the files are so few
+that only bytes count. The second comes from the small-file profile, where the
+cost of each file dominates. Both are fitted on every single-copy run that was
+measured, with the medium and the mixed profiles included, and the error of the
+fit is printed next to the result. A volume is priced with its real bytes and
+its real number of files, as the assessment read them.
+
+Copies that run at the same time slow each other down. The slowdown of the
+bytes part is taken from the large-file runs at that number of copies, and the
+slowdown of the per-file part from the small-file runs.
+
+Every figure says where it comes from:
+
+  measured  a rate that tp-bench measured on this cluster
+  read      a size or a count that tp-pre read from the cluster, or a constant
+            that the product uses
+  assumed   a choice made here, with the choice written next to it
+  unknown   nothing to say; no number is invented
+
+A volume whose number of files is unknown is priced as if it were full of the
+smallest files that were measured, the slow case, and is marked so. The
+estimate then errs long, not short.
+"""
+from __future__ import print_function
+
+import argparse
+import csv
+import datetime
+import json
+import math
+import os
+import sys
+
+# Constants of the product's own estimator. They are copied here because this
+# file runs without the product. A test compares them with the product's, so
+# they cannot drift apart unnoticed.
+FIXED_OVERHEAD_SECONDS = 5       # create the claim, schedule the Job, pull the image
+CUTOVER_OVERHEAD_SECONDS = 30    # stop the workload, swap the volume, start it again
+
+BASIS_MEASURED = "measured"
+BASIS_READ = "read"
+BASIS_ASSUMED = "assumed"
+BASIS_UNKNOWN = "unknown"
+
+MIB = 1048576.0
+GIB = 1024.0 ** 3
+DEFAULT_MARGIN_PCT = 50
+EXPECTED_K = 4
+HIGH_DISPERSION_PCT = 15.0       # a spread above this is said out loud
+BAD_FIT_PCT = 25.0               # a model error above this is said out loud
+SATURATION_GAIN = 0.15           # less than this extra throughput for more copies: saturated
+NODE_CPU_BOUND_PCT = 85.0
+PROFILES = ("large", "medium", "small", "mixed")
+DELTA_PCTS = (1, 10)
+
+
+class InputError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------- helpers --
+
+def is_num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def duration(seconds):
+    """45 s, 12 min, 2 h 05 min, 3 d 04 h."""
+    if seconds is None:
+        return "unknown"
+    seconds = float(seconds)
+    if seconds < 60:
+        return "%d s" % int(round(seconds))
+    minutes = int(round(seconds / 60.0))
+    if minutes < 120:
+        return "%d min" % minutes
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return "%d h %02d min" % (hours, minutes)
+    days, hours = divmod(hours, 24)
+    return "%d d %02d h" % (days, hours)
+
+
+def human_bytes(n):
+    if n is None:
+        return "unknown"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def mean(xs):
+    return sum(xs) / float(len(xs))
+
+
+def stdev(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+
+
+def cv_pct(xs):
+    """Spread of repeated measurements: standard deviation over the mean, in percent."""
+    if len(xs) < 2 or mean(xs) == 0:
+        return None
+    return 100.0 * stdev(xs) / mean(xs)
+
+
+def load_json(path, schema_prefix):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise InputError("cannot read %s: %s" % (path, exc))
+    schema = doc.get("schema", "") if isinstance(doc, dict) else ""
+    if not str(schema).startswith(schema_prefix):
+        raise InputError("%s is not a %s file (schema %r)" % (path, schema_prefix, schema))
+    return doc
+
+
+# ------------------------------------------------------------------- bench --
+
+def _good(copy):
+    return copy.get("rc") == 0 and is_num(copy.get("ms")) and copy["ms"] > 0
+
+
+class ClassData(object):
+    """The runs of one source class."""
+
+    def __init__(self, name, entry):
+        self.name = name
+        self.entry = entry
+        self.runs = [r for r in entry.get("runs") or [] if r.get("event", "run") == "run"]
+        self.failed_runs = 0
+
+    def reps(self, kind, profile, k=1, pct=None):
+        """[{secs, bytes, files, wall, sample}] -- one item per repetition that finished
+        cleanly. secs is the mean time of one copy in that repetition."""
+        out = []
+        for r in self.runs:
+            if r.get("pass") != kind or r.get("profile") != profile or r.get("k") != k:
+                continue
+            if pct is not None and r.get("pct") != pct:
+                continue
+            copies = r.get("copies") or []
+            if not copies or not all(_good(c) for c in copies):
+                self.failed_runs += 1
+                continue
+            out.append({
+                "secs": mean([c["ms"] for c in copies]) / 1000.0,
+                "bytes": mean([c.get("bytes", 0) for c in copies]),
+                "files": mean([c.get("files", 0) for c in copies]),
+                "wall": r.get("wall_ms", 0) / 1000.0, "k": k, "sample": r.get("sample") or {},
+                "changed_files": r.get("changed_files"), "changed_bytes": r.get("changed_bytes")})
+        return out
+
+    def ks(self, profile):
+        return sorted({r["k"] for r in self.runs if r.get("pass") == "unit" and r.get("profile") == profile
+                       and self.reps("unit", profile, r["k"])})
+
+
+def solve2(rows):
+    """Least squares of  1 = a * x + c * y  over rows (x, y); the rows are already
+    divided by the measured time, so the error that is minimised is the relative one.
+    Returns (a, c) or None when the rows cannot tell the two apart."""
+    sxx = sum(x * x for x, y in rows)
+    sxy = sum(x * y for x, y in rows)
+    syy = sum(y * y for x, y in rows)
+    bx = sum(x for x, y in rows)
+    by = sum(y for x, y in rows)
+    det = sxx * syy - sxy * sxy
+    if len(rows) < 2 or abs(det) < 1e-12 * max(1e-300, sxx * syy):
+        return None
+    return (bx * syy - by * sxy) / det, (sxx * by - sxy * bx) / det
+
+
+class Model(object):
+    """seconds = bytes * a + files * c, for one source class."""
+
+    def __init__(self, a, c, how, points, errors):
+        self.a, self.c, self.how, self.points, self.errors = a, c, how, points, errors
+        self.ahead = {}
+        self.ahead_model = None
+        self.walk_per_file = None
+
+    def seconds(self, nbytes, nfiles):
+        return nbytes * self.a + nfiles * self.c
+
+    @property
+    def mib_s(self):
+        return 1.0 / (self.a * MIB) if self.a > 0 else None
+
+    @property
+    def files_s(self):
+        return 1.0 / self.c if self.c > 0 else None
+
+
+def fit(points, only=None):
+    """points: [(profile, bytes, files, secs)]. Returns (a, c, how) or None."""
+    use = [p for p in points if (only is None or p[0] in only) and p[3] > 0]
+    rows = [(b / s, f / s) for _, b, f, s in use]
+    got = solve2(rows) if rows else None
+    if got and got[0] > 0 and got[1] > 0:
+        return got[0], got[1], "least squares on %d single-copy runs" % len(rows)
+    # Two numbers from two profiles: bytes from the large one, the per-file cost
+    # from what the small one costs beyond its bytes.
+    large = [(b, f, s) for p, b, f, s in points if p == "large" and s > 0 and b > 0]
+    small = [(b, f, s) for p, b, f, s in points if p == "small" and s > 0 and f > 0]
+    if not (large and small):
+        return None
+    a = mean([s / b for b, f, s in large])
+    c = mean([max(s - a * b, 0.0) / f for b, f, s in small])
+    if a > 0 and c > 0:
+        return a, c, "large profile for bytes, small profile for files (the fit over all runs was not usable)"
+    return None
+
+
+class Bench(object):
+    def __init__(self, doc):
+        self.doc = doc
+        self.classes = {}
+        for entry in doc.get("classes") or []:
+            self.classes[entry.get("source_class")] = ClassData(entry.get("source_class"), entry)
+        self.models = {}
+        for name, cd in self.classes.items():
+            m = self._model_of(cd)
+            if m:
+                self.models[name] = m
+        self.avg_small = self._avg_small()
+
+    def _avg_small(self):
+        for cd in self.classes.values():
+            fill = (cd.entry.get("fill") or {}).get("small") or {}
+            if fill.get("files") and fill.get("bytes"):
+                return fill["bytes"] / float(fill["files"])
+        return 4.5 * 1024
+
+    def points(self, cd):
+        pts = []
+        for profile in PROFILES:
+            for kind in ("unit", "full"):
+                for r in cd.reps(kind, profile, 1):
+                    pts.append((profile, r["bytes"], r["files"], r["secs"]))
+        return pts
+
+    def _model_of(self, cd):
+        pts = self.points(cd)
+        got = fit(pts)
+        if not got:
+            return None
+        a, c, how = got
+        errors = {}
+        for profile in PROFILES:
+            mine = [(b, f, s) for p, b, f, s in pts if p == profile]
+            if mine:
+                errors[profile] = mean([abs(a * b + c * f - s) / s * 100.0 for b, f, s in mine])
+        m = Model(a, c, how, pts, errors)
+        # What the two-profile model would have said about the profiles it never saw.
+        pre = fit(pts, only=("large", "small"))
+        if pre:
+            m.ahead_model = pre
+            for profile in ("medium", "mixed"):
+                mine = [(b, f, s) for p, b, f, s in pts if p == profile]
+                if mine:
+                    m.ahead[profile] = mean([abs(pre[0] * b + pre[1] * f - s) / s * 100.0 for b, f, s in mine])
+        # the walk of an unchanged tree, seconds per file
+        walks = []
+        for profile in ("small", "mixed", "medium"):
+            for r in cd.reps("noop", profile, 1):
+                if r["files"]:
+                    walks.append(r["secs"] / r["files"])
+        m.walk_per_file = mean(walks) if walks else None
+        return m
+
+    def ks(self):
+        """Numbers of copies at once measured for both the large and the small profile."""
+        sets = [set(cd.ks("large")) & set(cd.ks("small")) for cd in self.classes.values()]
+        return sorted(set().union(*sets)) if sets else []
+
+    def has_data(self):
+        return bool(self.models)
+
+    def pick_k(self, wanted):
+        ks = self.ks()
+        return min(ks, key=lambda k: (abs(k - wanted), k)) if ks else None
+
+    def model_for(self, cls):
+        """(Model, basis, text). A class nobody measured borrows the slowest measured one."""
+        if cls in self.models:
+            return self.models[cls], BASIS_MEASURED, "class %s" % cls
+        if not self.models:
+            return None, BASIS_UNKNOWN, "no measurement"
+        slow = max(self.models.items(), key=lambda kv: kv[1].seconds(GIB, 1e5))
+        return slow[1], BASIS_ASSUMED, "class %s was not measured; slowest measured class %s" % (cls, slow[0])
+
+    def slowdown(self, cls, profile, k):
+        """(factor, basis) -- how much longer one copy takes with k at once than with one."""
+        if k == 1:
+            return 1.0, BASIS_MEASURED
+        own = cls in self.classes and self.classes[cls].reps("unit", profile, k)
+        cands = [cls] if own else [n for n in self.classes if self.classes[n].reps("unit", profile, k)]
+        factors = []
+        for n in cands:
+            one = self.classes[n].reps("unit", profile, 1)
+            many = self.classes[n].reps("unit", profile, k)
+            if one and many:
+                factors.append(mean([r["secs"] for r in many]) / mean([r["secs"] for r in one]))
+        if not factors:
+            return None, BASIS_UNKNOWN
+        return (factors[0] if own else max(factors)), (BASIS_MEASURED if own else BASIS_ASSUMED)
+
+    # ---- the tables of what was measured
+    def profile_rows(self):
+        rows = []
+        for name, cd in sorted(self.classes.items()):
+            for profile in PROFILES:
+                for kind in ("unit", "full"):
+                    rs = cd.reps(kind, profile, 1)
+                    if not rs:
+                        continue
+                    mib = [r["bytes"] / MIB / r["secs"] for r in rs]
+                    fil = [r["files"] / r["secs"] for r in rs]
+                    rows.append({"class": name, "profile": profile, "what": kind, "reps": len(rs),
+                                 "mib_s": mean(mib), "files_s": mean(fil), "cv": cv_pct(mib),
+                                 "bytes": mean([r["bytes"] for r in rs]), "files": mean([r["files"] for r in rs]),
+                                 "secs": mean([r["secs"] for r in rs])})
+        return rows
+
+    def scaling_rows(self):
+        rows = []
+        for name, cd in sorted(self.classes.items()):
+            base = {}
+            prev = {}
+            for profile, unit in (("large", "MiB/s"), ("small", "files/s")):
+                for k in cd.ks(profile):
+                    rs = cd.reps("unit", profile, k)
+                    if unit == "MiB/s":
+                        agg = [k * r["bytes"] / MIB / r["wall"] for r in rs if r["wall"] > 0]
+                    else:
+                        agg = [k * r["files"] / r["wall"] for r in rs if r["wall"] > 0]
+                    if not agg:
+                        continue
+                    a = mean(agg)
+                    if k == 1:
+                        base[profile] = a
+                    cpu = [r["sample"].get("node_cpu_max_pct") for r in rs if is_num(r["sample"].get("node_cpu_max_pct"))]
+                    mem = [r["sample"].get("pod_mem_max_bytes") for r in rs if is_num(r["sample"].get("pod_mem_max_bytes"))]
+                    gain = None if profile not in prev else (a / prev[profile] - 1.0)
+                    prev[profile] = a
+                    rows.append({"class": name, "profile": profile, "k": k, "agg": a, "unit": unit,
+                                 "cv": cv_pct(agg), "reps": len(agg),
+                                 "efficiency": (a / (k * base[profile])) if base.get(profile) else None,
+                                 "gain": gain, "node_cpu_max": max(cpu) if cpu else None,
+                                 "pod_mem_max": max(mem) if mem else None})
+        return rows
+
+    def saturation(self):
+        """{(class, profile): text} -- where more copies stopped paying, and what that points at."""
+        out = {}
+        rows = self.scaling_rows()
+        for key in sorted({(r["class"], r["profile"]) for r in rows}):
+            mine = [r for r in rows if (r["class"], r["profile"]) == key]
+            sat = next((r for r in mine if r["gain"] is not None and r["gain"] < SATURATION_GAIN), None)
+            if not sat:
+                out[key] = "no saturation seen up to %d copies at once" % mine[-1]["k"]
+                continue
+            cpu = sat["node_cpu_max"]
+            if is_num(cpu) and cpu >= NODE_CPU_BOUND_PCT:
+                why = "the node CPU reached %d percent: the node is the limit" % cpu
+            elif is_num(cpu):
+                why = ("the node CPU stayed at %d percent at most, so the limit is the network or the array; "
+                       "this test cannot tell those two apart" % cpu)
+            else:
+                why = "the node CPU was not read, so the cause is unknown"
+            out[key] = "going to %d copies at once gained less than %d percent; %s" % (
+                sat["k"], int(SATURATION_GAIN * 100), why)
+        return out
+
+    def delta_checks(self, cls, m):
+        """Measured incremental passes against what the model says about them."""
+        rows = []
+        cd = self.classes[cls]
+        for profile in ("medium", "small", "mixed"):
+            for pct in DELTA_PCTS:
+                rs = cd.reps("delta", profile, 1, pct=pct)
+                if not rs:
+                    continue
+                meas = mean([r["secs"] for r in rs])
+                pred = delta_seconds(m, mean([r["bytes"] for r in rs]), mean([r["files"] for r in rs]), pct)
+                rows.append({"class": cls, "profile": profile, "pct": pct, "reps": len(rs),
+                             "measured": meas, "predicted": pred,
+                             "error": None if pred is None else abs(pred - meas) / meas * 100.0,
+                             "cv": cv_pct([r["secs"] for r in rs])})
+        return rows
+
+
+def delta_seconds(m, nbytes, nfiles, pct):
+    """A final pass: walk the whole tree, then copy the part that changed."""
+    if m.walk_per_file is None:
+        return None
+    return m.walk_per_file * nfiles + (pct / 100.0) * m.seconds(nbytes, nfiles)
+
+
+# ----------------------------------------------------------------- volumes --
+
+def read_pvcs(assessment, only_ns):
+    pvcs = assessment.get("pvcs")
+    if not isinstance(pvcs, list):
+        raise InputError("the assessment has no list of claims (pvcs: %r)" % (pvcs,))
+    return [r for r in pvcs if not only_ns or r.get("namespace") in only_ns]
+
+
+def file_count_of(row):
+    """(files or None, basis text, lower_bound)."""
+    fc = row.get("file_count")
+    if isinstance(fc, dict) and is_num(fc.get("files")):
+        if fc.get("capped"):
+            return fc["files"], "read: find stopped at its cap of %s files, so this is a lower bound" % fc.get("cap"), True
+        return fc["files"], "read: find in the pod", False
+    inodes = row.get("inodes_used")
+    if is_num(inodes):
+        return inodes, "read: kubelet inodes (files and directories, may include more than this volume)", False
+    return None, "unknown", False
+
+
+def kind_of(avg_bytes):
+    """A label for the table only. The time does not depend on it."""
+    if avg_bytes >= 8 * MIB:
+        return "large files"
+    if avg_bytes >= 64 * 1024:
+        return "medium files"
+    return "small files"
+
+
+def volume_model(row, bench):
+    v = {"namespace": row.get("namespace"), "pvc": row.get("name"), "class": row.get("storage_class"),
+         "mode": row.get("volume_mode") or "Filesystem", "notes": []}
+    used = row.get("used_bytes")
+    if is_num(used):
+        v["used"], v["used_basis"] = float(used), "read: kubelet stats"
+    else:
+        req = row.get("requested_bytes")
+        if is_num(req):
+            v["used"], v["used_basis"] = float(req), "assumed: used size unknown, the requested size is used as an upper bound"
+            v["notes"].append("used size unknown")
+        else:
+            v["used"], v["used_basis"] = None, "unknown"
+            v["notes"].append("size unknown: not in the totals")
+    files, fbasis, lower = file_count_of(row)
+    v["files"], v["files_basis"] = files, fbasis
+    v["files_priced"] = files
+    v["pessimistic"] = False
+    if lower:
+        v["notes"].append("file count is a lower bound")
+    if v["mode"] == "Block":
+        v["kind"], v["kind_basis"] = "block", "read: raw block volume, copied end to end"
+        v["files"], v["files_basis"], v["files_priced"] = None, "n/a: raw block volume", 0
+    elif v["used"] is None:
+        v["kind"], v["kind_basis"] = "unknown", "unknown"
+    elif files is None:
+        v["pessimistic"] = True
+        v["files_priced"] = v["used"] / bench.avg_small
+        v["kind"] = "small files (assumed)"
+        v["kind_basis"] = ("assumed: number of files unknown, priced as the smallest files measured (the slow case): "
+                           "files taken as size / %s" % human_bytes(bench.avg_small))
+        v["notes"].append("files unknown: pessimistic profile")
+    elif v["used"] == 0 or files == 0:
+        v["kind"], v["kind_basis"] = "empty", "read: no data"
+    else:
+        v["kind"] = kind_of(v["used"] / files)
+        v["kind_basis"] = "read: %s per file on average" % human_bytes(v["used"] / files)
+    return v
+
+
+def copy_seconds(v, bench, k):
+    """(seconds or None, text, basis) for one claim copied while k copies run."""
+    if v["used"] is None or v["kind"] == "unknown":
+        return None, "unknown", BASIS_UNKNOWN
+    m, basis, text = bench.model_for(v["class"])
+    if m is None:
+        return None, text, BASIS_UNKNOWN
+    if v["kind"] == "empty":
+        return float(FIXED_OVERHEAD_SECONDS), "no data to move", BASIS_READ
+    fb, b1 = bench.slowdown(v["class"], "large", k)
+    fs, b2 = bench.slowdown(v["class"], "small", k)
+    if fb is None or fs is None:
+        return None, "no measurement with %d copies at once" % k, BASIS_UNKNOWN
+    secs = v["used"] * m.a * fb + v["files_priced"] * m.c * fs + FIXED_OVERHEAD_SECONDS
+    if BASIS_ASSUMED in (basis, b1, b2) or v["pessimistic"]:
+        basis = BASIS_ASSUMED
+    else:
+        basis = BASIS_MEASURED
+    return secs, "%s: %.1f MiB/s for bytes, %.0f files/s for files, %d at once" % (
+        text, m.mib_s, m.files_s, k), basis
+
+
+def window_seconds(v, bench, pct):
+    """Seconds of the last pass of a live copy, with pct percent of the data changed."""
+    if v["used"] is None or v["kind"] == "unknown":
+        return None, BASIS_UNKNOWN
+    m, basis, _ = bench.model_for(v["class"])
+    if m is None:
+        return None, BASIS_UNKNOWN
+    if v["kind"] == "block":
+        # a block volume is copied again end to end; there is no walk to save
+        return v["used"] * m.a, basis
+    if m.walk_per_file is None:
+        return None, BASIS_UNKNOWN
+    t = delta_seconds(m, v["used"], v["files_priced"], pct)
+    return t, (BASIS_ASSUMED if (v["pessimistic"] or basis != BASIS_MEASURED) else BASIS_MEASURED)
+
+
+def simulate(jobs, slots, ks):
+    """Seconds to finish `jobs` with at most `slots` copies at once.
+
+    A job is {measured k: seconds the copy takes while k copies run}. The
+    longest job starts first. While m copies run, each one moves at the speed
+    measured with the largest measured count that does not exceed m, so a tail
+    of few copies is not priced at the slow per-copy speed of a full house.
+    """
+    jobs = [j for j in jobs if j]
+    if not jobs:
+        return 0.0
+    ks = sorted(ks)
+    first = ks[0]
+
+    def secs(job, m):
+        usable = [k for k in ks if k <= m] or [first]
+        for k in reversed(usable):
+            if job.get(k) is not None:
+                return job[k]
+        return job[first]
+
+    pending = sorted(jobs, key=lambda j: -(j.get(first) or 0.0))
+    running = []
+    now = 0.0
+    while pending or running:
+        while pending and len(running) < max(1, slots):
+            running.append([1.0, pending.pop(0)])
+        m = len(running)
+        step = min(rem * secs(job, m) for rem, job in running)
+        now += step
+        for item in running:
+            item[0] -= step / secs(item[1], m)
+        running = [it for it in running if it[0] > 1e-9]
+    return now
+
+
+# ------------------------------------------------------------------ tables --
+
+def build(assessment, bench_doc, opts):
+    bench = Bench(bench_doc)
+    rows = read_pvcs(assessment, opts.get("namespaces"))
+    vols = [volume_model(r, bench) for r in rows]
+    notes = []
+    if not bench.has_data():
+        notes.append("The measurement has no complete single-copy run. Every time is unknown.")
+    ks = bench.ks()
+    k_opt = max(ks) if ks else None
+    k_exp = bench.pick_k(EXPECTED_K)
+    k_one = 1 if 1 in ks else None
+    if ks and k_one is None:
+        notes.append("A single copy was not measured, so there is no pessimistic scenario.")
+
+    for v in vols:
+        v["tk"] = {}
+        for k in ks:
+            v["tk"][k] = copy_seconds(v, bench, k)[0]
+        for tag, k in (("t1", k_one), ("texp", k_exp)):
+            if k is None:
+                v[tag], v[tag + "_text"], v[tag + "_basis"] = None, "unknown", BASIS_UNKNOWN
+            else:
+                v[tag], v[tag + "_text"], v[tag + "_basis"] = copy_seconds(v, bench, k)
+        for pct in DELTA_PCTS:
+            v["w%d" % pct], v["w%d_basis" % pct] = window_seconds(v, bench, pct)
+
+    by_ns = {}
+    for v in vols:
+        by_ns.setdefault(v["namespace"], []).append(v)
+    ns_rows = []
+    for ns in sorted(by_ns):
+        group = by_ns[ns]
+        known = [v for v in group if v["t1"] is not None]
+        cold_exp = simulate([v["tk"] for v in known], k_exp, ks) if k_exp else None
+        cold_one = sum(v["t1"] for v in known) if k_one else None
+        row = {"namespace": ns, "pvcs": len(group), "used": sum(v["used"] or 0 for v in group),
+               "files": sum((v["files_priced"] or 0) for v in group),
+               "unknown_volumes": len(group) - len(known),
+               "cold_expected": cold_exp, "cold_serial": cold_one,
+               "cold_downtime_expected": None if cold_exp is None else cold_exp + CUTOVER_OVERHEAD_SECONDS,
+               "initial_livesync": cold_exp}
+        for pct in DELTA_PCTS:
+            parts = [v["w%d" % pct] for v in group]
+            if any(p is None for p in parts):
+                row["window%d" % pct] = None
+                row["window%d_basis" % pct] = BASIS_UNKNOWN
+            else:
+                row["window%d" % pct] = sum(parts) + CUTOVER_OVERHEAD_SECONDS
+                bs = [v["w%d_basis" % pct] for v in group]
+                row["window%d_basis" % pct] = BASIS_ASSUMED if BASIS_ASSUMED in bs else BASIS_MEASURED
+        ns_rows.append(row)
+
+    scenarios = []
+    margin = 1.0 + opts["margin_pct"] / 100.0
+    for name, k, serial in (("optimistic", k_opt, False), ("expected", k_exp, False), ("pessimistic", k_one, True)):
+        if k is None:
+            scenarios.append({"scenario": name, "k": None, "total": None, "critical": None,
+                              "basis": BASIS_UNKNOWN, "text": "no measurement"})
+            continue
+        times = [(copy_seconds(v, bench, k), v) for v in vols]
+        for (t, _text, b), v in times:
+            v.setdefault("sc", {})[name] = (t, b)
+        priced = [(t, v) for (t, _x, _b), v in times if t is not None]
+        total = sum(t for t, _ in priced) * margin if serial else simulate([v["tk"] for _, v in priced], k, ks)
+        crit = None
+        for t, v in priced:
+            alone = t * margin if serial else min(x for x in v["tk"].values() if x is not None)
+            if crit is None or alone > crit[0]:
+                crit = (alone, v)
+        n_assumed = sum(1 for _, v in times if v["sc"][name][1] == BASIS_ASSUMED)
+        scenarios.append({
+            "scenario": name, "k": k, "total": total,
+            "critical": None if crit is None else {"namespace": crit[1]["namespace"], "pvc": crit[1]["pvc"],
+                                                   "seconds": crit[0], "used": crit[1]["used"]},
+            "basis": BASIS_ASSUMED if n_assumed else BASIS_MEASURED,
+            "assumed_volumes": n_assumed, "volumes": len(times),
+            "unknown_volumes": sum(1 for (t, _x, _b), _v in times if t is None),
+            "text": ("everything one after another at the speed of 1 copy, plus %d percent (assumed)" % opts["margin_pct"])
+                    if serial else "%d copies at once; a shorter queue runs at the speed measured with fewer copies" % k,
+        })
+
+    profiles = bench.profile_rows()
+    scaling = bench.scaling_rows()
+    sat = bench.saturation()
+    deltas = []
+    for name, m in sorted(bench.models.items()):
+        deltas += bench.delta_checks(name, m)
+    for r in profiles:
+        if r["cv"] is not None and r["cv"] > HIGH_DISPERSION_PCT:
+            notes.append("HIGH DISPERSION: class %s, %s profile (%s): the %d repetitions differ by %d percent (standard "
+                         "deviation over the mean). Treat this rate as rough." % (
+                             r["class"], r["profile"], "whole tree" if r["what"] == "full" else "one slice", r["reps"], round(r["cv"])))
+    for name, m in sorted(bench.models.items()):
+        for profile, err in sorted(m.errors.items()):
+            if err > BAD_FIT_PCT:
+                notes.append("POOR FIT: class %s, the two-number model is off by %d percent on the %s profile."
+                             % (name, round(err), profile))
+    for name, cd in bench.classes.items():
+        if name not in bench.models:
+            notes.append("class %s has no usable single-copy run; it is priced with the slowest class that has one." % name)
+        if cd.failed_runs:
+            notes.append("class %s: %d run(s) had a failed copy and are not used." % (name, cd.failed_runs))
+    pod = bench_doc.get("pod") or {}
+    cache = pod.get("cache_check") or {}
+    if cache and cache.get("ok") is False:
+        notes.append("The large-file data is only %.1f times the memory of the copy pod, below the 2 times that keeps "
+                     "it out of the cache: the byte rate may be too high." % cache.get("ratio", 0))
+    return {"volumes": vols, "namespaces": ns_rows, "scenarios": scenarios, "notes": notes,
+            "k": {"optimistic": k_opt, "expected": k_exp, "pessimistic": k_one},
+            "bench": bench, "opts": opts, "profiles": profiles, "scaling": scaling, "saturation": sat,
+            "deltas": deltas, "owner": bench_doc.get("owner_test"), "pod": pod, "ks": ks}
+
+
+# ------------------------------------------------------------------ output --
+
+def cell_time(seconds, basis):
+    if seconds is None:
+        return "unknown"
+    return "%s (%s)" % (duration(seconds), basis)
+
+
+def pvc_table(res):
+    head = ["namespace", "pvc", "class", "used", "files", "kind", "copy time, 1 copy at a time",
+            "copy time, %s at once" % (res["k"]["expected"] or "n/a"), "basis"]
+    rows = []
+    for v in res["volumes"]:
+        files = "unknown" if v["files"] is None else "%d" % v["files"]
+        if v["files"] is None and v["mode"] == "Block":
+            files = "n/a (block)"
+        rows.append([v["namespace"], v["pvc"], v["class"], human_bytes(v["used"]) if v["used"] is not None else "unknown",
+                     files, v["kind"], cell_time(v["t1"], v["t1_basis"]), cell_time(v["texp"], v["texp_basis"]),
+                     "size: %s. files: %s. kind: %s. rate: %s" % (v["used_basis"], v["files_basis"], v["kind_basis"], v["texp_text"])])
+    return head, rows
+
+
+def ns_table(res):
+    head = ["namespace", "pvcs", "used", "cold copy, expected (apps stopped)", "cold copy, one volume at a time",
+            "downtime of a cold copy, expected", "live-sync first copy (apps running)",
+            "live-sync cutover window, 1 percent changed", "live-sync cutover window, 10 percent changed", "basis"]
+    rows = []
+    for n in res["namespaces"]:
+        def t(x, basis=BASIS_MEASURED):
+            return cell_time(x, basis) if x is not None else "unknown"
+        rows.append([n["namespace"], n["pvcs"], human_bytes(n["used"]), t(n["cold_expected"]), t(n["cold_serial"]),
+                     t(n["cold_downtime_expected"]), t(n["initial_livesync"]),
+                     t(n["window1"], n["window1_basis"]), t(n["window10"], n["window10_basis"]),
+                     "window = a pass over the whole tree + the changed share copied + %d s to stop and start "
+                     "(read: product constant). The walk and the copy rates are measured." % CUTOVER_OVERHEAD_SECONDS])
+    return head, rows
+
+
+def cluster_table(res):
+    head = ["scenario", "copies at once", "total copy time", "critical path: the largest volume",
+            "its copy time alone", "share of the total", "basis"]
+    rows = []
+    for s in res["scenarios"]:
+        if s["total"] is None:
+            rows.append([s["scenario"], "n/a", "unknown", "unknown", "unknown", "n/a", s["text"]])
+            continue
+        c = s["critical"]
+        share = "n/a" if not c or not s["total"] else "%d percent" % round(100.0 * c["seconds"] / s["total"])
+        extra = ""
+        if s.get("unknown_volumes"):
+            extra = ". %d volume(s) have no time and are not in the total" % s["unknown_volumes"]
+        label = s["basis"] if not s.get("assumed_volumes") else "measured rates, %d of %d volumes assumed" % (
+            s["assumed_volumes"], s["volumes"])
+        rows.append([s["scenario"], s["k"], cell_time(s["total"], label),
+                     "%s/%s (%s)" % (c["namespace"], c["pvc"], human_bytes(c["used"])) if c else "n/a",
+                     duration(c["seconds"]) if c else "n/a", share, s["text"] + extra])
+    return head, rows
+
+
+def profile_table(res):
+    head = ["source class", "profile", "run", "repetitions", "MiB/s", "files/s", "spread", "note"]
+    rows = []
+    for r in res["profiles"]:
+        spread = "n/a (one run)" if r["cv"] is None else "%d percent" % round(r["cv"])
+        note = "HIGH DISPERSION" if r["cv"] is not None and r["cv"] > HIGH_DISPERSION_PCT else ""
+        rows.append([r["class"], r["profile"], "whole tree" if r["what"] == "full" else "one slice", r["reps"],
+                     "%.1f" % r["mib_s"], ("%.0f" if r["files_s"] >= 10 else "%.2f") % r["files_s"], spread, note])
+    return head, rows
+
+
+def model_table(res):
+    head = ["source class", "bytes per second", "files per second", "fitted how", "error on large", "error on medium",
+            "error on small", "error on mixed", "error before the mixed was used (medium / mixed)"]
+    rows = []
+    for name, m in sorted(res["bench"].models.items()):
+        def e(p):
+            return "%d percent" % round(m.errors[p]) if p in m.errors else "n/a"
+        ahead = " / ".join(("%d percent" % round(m.ahead[p])) if p in m.ahead else "n/a" for p in ("medium", "mixed"))
+        rows.append([name, "%.1f MiB/s" % m.mib_s, "%.0f files/s" % m.files_s, m.how, e("large"), e("medium"),
+                     e("small"), e("mixed"), ahead])
+    return head, rows
+
+
+def scaling_table(res):
+    head = ["source class", "profile", "copies at once", "total throughput", "of perfect scaling", "more than before",
+            "node CPU, busiest", "pod memory, peak", "spread"]
+    rows = []
+    for r in res["scaling"]:
+        rows.append([r["class"], r["profile"], r["k"], "%.0f %s" % (r["agg"], r["unit"]),
+                     "n/a" if r["efficiency"] is None else "%d percent" % round(100 * r["efficiency"]),
+                     "n/a" if r["gain"] is None else "%+d percent" % round(100 * r["gain"]),
+                     "n/a" if r["node_cpu_max"] is None else "%d percent" % round(r["node_cpu_max"]),
+                     "n/a" if r["pod_mem_max"] is None else human_bytes(r["pod_mem_max"]),
+                     "n/a" if r["cv"] is None else "%d percent" % round(r["cv"])])
+    return head, rows
+
+
+def delta_table(res):
+    head = ["source class", "profile", "changed", "repetitions", "measured", "model says", "error"]
+    rows = []
+    for d in res["deltas"]:
+        rows.append([d["class"], d["profile"], "%d percent of the files" % d["pct"], d["reps"], duration(d["measured"]),
+                     duration(d["predicted"]), "n/a" if d["error"] is None else "%d percent" % round(d["error"])])
+    return head, rows
+
+
+def md_table(head, rows):
+    def esc(x):
+        return str(x).replace("|", "/")
+    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for r in rows:
+        out.append("| " + " | ".join(esc(c) for c in r) + " |")
+    return "\n".join(out)
+
+
+def owner_lines(owner):
+    items = owner if isinstance(owner, list) else ([owner] if owner else [])
+    out = []
+    for o in items:
+        if o.get("tested") is True:
+            out.append("wrote %s, read back %s: %s" % (o.get("wrote"), o.get("read_back", "n/a"), o.get("verdict")))
+        elif o.get("tested") is False:
+            out.append("not tested: %s" % o.get("why"))
+        elif o.get("event") == "owner":
+            out.append("an ordinary file created on the destination reads back as %s (the pod runs as %s:%s)" % (
+                o.get("created_file_reads_back_as"), o.get("uid"), o.get("gid")))
+    return out
+
+
+def render_md(res, meta):
+    out = ["# Migration time estimate", "",
+           "Generated %s from `%s` and `%s`." % (meta["generated"], meta["assessment"], meta["bench"]), "",
+           "Each figure says where it comes from: **measured** (tp-bench on this cluster), **read** (from the "
+           "assessment, or a constant of the product), **assumed** (a choice written next to it) or **unknown**.", ""]
+    if res["notes"]:
+        out += ["## Read this first", ""] + ["- " + n for n in res["notes"]] + [""]
+    vols = res["volumes"]
+    nfiles = sum(1 for v in vols if v["pessimistic"])
+    nused = sum(1 for v in vols if v["used"] is None or "assumed" in v["used_basis"])
+    out += ["## Whole cluster", "", md_table(*cluster_table(res)), "",
+            "Volumes in the estimate: %d. Without a file count, priced as small files: %d. Without a used size: %d." % (
+                len(vols), nfiles, nused), ""]
+    out += ["## By namespace", "", md_table(*ns_table(res)), "",
+            "The window is the time the applications are stopped in a live-sync cutover. It is built from measured "
+            "passes: one pass over the whole tree, plus the share that changed, plus %d seconds to stop and start. "
+            "Both shares of change were measured on the test data." % CUTOVER_OVERHEAD_SECONDS, ""]
+    out += ["## By volume", "", md_table(*pvc_table(res)), ""]
+    out += ["## What was measured, by profile", "", md_table(*profile_table(res)), "",
+            "A spread is the standard deviation of the repetitions over their mean. Above %d percent it is flagged." % int(HIGH_DISPERSION_PCT), ""]
+    out += ["## The model and its error", "", md_table(*model_table(res)), "",
+            "Time of a volume = bytes / bytes per second + files x seconds per file. The error is how far the model "
+            "is from the runs it was fitted on, profile by profile.", ""]
+    if res["deltas"]:
+        out += ["## The last pass of a live copy, measured", "", md_table(*delta_table(res)), ""]
+    out += ["## Where more copies at once stop paying", "", md_table(*scaling_table(res)), ""]
+    for (cls, prof), text in sorted(res["saturation"].items()):
+        out.append("- class %s, %s files: %s." % (cls, prof, text))
+    out.append("")
+    lines = owner_lines(res.get("owner"))
+    if lines:
+        out += ["## Owner test on the destination", ""] + ["- " + l for l in lines] + [""]
+    pod = res.get("pod") or {}
+    if pod:
+        ram = pod.get("ram_limit_bytes")
+        out += ["## Conditions of the test", "",
+                "- copy pod memory limit: %s; node memory: %s; node CPUs: %s" % (
+                    human_bytes(ram) if is_num(ram) and ram else "no limit read",
+                    human_bytes(pod.get("host_ram_bytes")) if is_num(pod.get("host_ram_bytes")) else "unknown",
+                    pod.get("cpus", "unknown"))]
+        cc = pod.get("cache_check") or {}
+        if cc:
+            out.append("- large-file data / pod memory: %.1f times (%s)" % (
+                cc.get("ratio", 0), "at least 2: it cannot sit in the cache" if cc.get("ok") else "BELOW 2"))
+        out.append("")
+    return "\n".join(out)
+
+
+def write_csv(path, head, rows):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        w = csv.writer(handle)
+        w.writerow(head)
+        w.writerows(rows)
+
+
+def csv_tables(res):
+    """Machine-readable twins: seconds as numbers, basis in its own column."""
+    vh = ["namespace", "pvc", "class", "volume_mode", "used_bytes", "used_basis", "files", "files_basis", "kind",
+          "kind_basis", "seconds_one_at_a_time", "basis_one_at_a_time", "seconds_expected", "basis_expected", "rate_used"]
+    vr = []
+    for v in res["volumes"]:
+        vr.append([v["namespace"], v["pvc"], v["class"], v["mode"],
+                   "" if v["used"] is None else int(v["used"]), v["used_basis"],
+                   "unknown" if v["files"] is None else int(v["files"]), v["files_basis"], v["kind"], v["kind_basis"],
+                   "unknown" if v["t1"] is None else round(v["t1"], 1), v["t1_basis"],
+                   "unknown" if v["texp"] is None else round(v["texp"], 1), v["texp_basis"], v["texp_text"]])
+    nh = ["namespace", "pvcs", "used_bytes", "cold_copy_expected_s", "cold_copy_serial_s", "cold_downtime_expected_s",
+          "livesync_first_copy_s", "window_1pct_s", "window_10pct_s", "window_1pct_basis", "window_10pct_basis"]
+    nr = []
+    for n in res["namespaces"]:
+        nr.append([n["namespace"], n["pvcs"], int(n["used"])] +
+                  ["unknown" if n[k] is None else round(n[k], 1) for k in
+                   ("cold_expected", "cold_serial", "cold_downtime_expected", "initial_livesync", "window1", "window10")] +
+                  [n["window1_basis"], n["window10_basis"]])
+    ch = ["scenario", "copies_at_once", "total_s", "basis", "critical_namespace", "critical_pvc", "critical_s",
+          "critical_used_bytes", "volumes_without_time", "how"]
+    cr = []
+    for s in res["scenarios"]:
+        c = s.get("critical") or {}
+        cr.append([s["scenario"], "" if s["k"] is None else s["k"], "unknown" if s["total"] is None else round(s["total"], 1),
+                   s["basis"], c.get("namespace", ""), c.get("pvc", ""), "" if not c else round(c["seconds"], 1),
+                   "" if not c else int(c["used"] or 0), s.get("unknown_volumes", ""), s["text"]])
+    ph = ["source_class", "profile", "run", "repetitions", "mib_per_s", "files_per_s", "spread_percent", "high_dispersion"]
+    pr = [[r["class"], r["profile"], r["what"], r["reps"], round(r["mib_s"], 2), round(r["files_s"], 1),
+           "" if r["cv"] is None else round(r["cv"], 1), "yes" if r["cv"] is not None and r["cv"] > HIGH_DISPERSION_PCT else "no"]
+          for r in res["profiles"]]
+    sh = ["source_class", "profile", "copies_at_once", "throughput", "unit", "efficiency", "node_cpu_max_pct",
+          "pod_mem_max_bytes", "spread_percent"]
+    sr = [[r["class"], r["profile"], r["k"], round(r["agg"], 2), r["unit"],
+           "" if r["efficiency"] is None else round(r["efficiency"], 3),
+           "" if r["node_cpu_max"] is None else round(r["node_cpu_max"], 1),
+           "" if r["pod_mem_max"] is None else int(r["pod_mem_max"]),
+           "" if r["cv"] is None else round(r["cv"], 1)] for r in res["scaling"]]
+    return {"volumes": (vh, vr), "namespaces": (nh, nr), "cluster": (ch, cr), "profiles": (ph, pr), "scaling": (sh, sr)}
+
+
+def write_xlsx(path, res):
+    try:
+        import openpyxl
+    except ImportError:
+        return False
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for name, (head, rows) in (("Cluster", cluster_table(res)), ("Namespaces", ns_table(res)),
+                               ("Volumes", pvc_table(res)), ("Profiles", profile_table(res)),
+                               ("Model", model_table(res)), ("Scaling", scaling_table(res))):
+        ws = wb.create_sheet(name)
+        ws.append(head)
+        for r in rows:
+            ws.append(list(r))
+        for col in ws.columns:
+            vals = [len(str(c.value)) for c in col if c.value is not None]
+            ws.column_dimensions[col[0].column_letter].width = min(60, (max(vals) if vals else 8) + 2)
+    wb.save(path)
+    return True
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--assessment", required=True, help="tp-pre-<context>-<date>.json")
+    ap.add_argument("--bench", required=True, help="tp-bench-<context>-<date>.json")
+    ap.add_argument("--out", default="tp-estimate", help="prefix of the output files (default: tp-estimate)")
+    ap.add_argument("-n", "--namespaces", default="", help="only these namespaces, comma separated")
+    ap.add_argument("--margin-pct", type=int, default=DEFAULT_MARGIN_PCT,
+                    help="margin added to the pessimistic scenario (default 50)")
+    args = ap.parse_args(argv)
+    try:
+        assessment = load_json(args.assessment, "tp-pre-inventory/")
+        bench = load_json(args.bench, "tp-bench/2")
+        opts = {"margin_pct": args.margin_pct, "namespaces": set(x for x in args.namespaces.split(",") if x)}
+        res = build(assessment, bench, opts)
+    except InputError as exc:
+        sys.stderr.write("tp-estimate: %s\n" % exc)
+        return 2
+    meta = {"generated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "assessment": os.path.basename(args.assessment), "bench": os.path.basename(args.bench)}
+    written = []
+    with open(args.out + ".md", "w", encoding="utf-8") as handle:
+        handle.write(render_md(res, meta))
+    written.append(args.out + ".md")
+    for name, (head, rows) in csv_tables(res).items():
+        p = "%s-%s.csv" % (args.out, name)
+        write_csv(p, head, rows)
+        written.append(p)
+    if write_xlsx(args.out + ".xlsx", res):
+        written.append(args.out + ".xlsx")
+    else:
+        print("openpyxl is not installed: no xlsx, the csv files carry the same tables")
+    if res["notes"]:
+        print("Read this first:")
+        for n in res["notes"]:
+            print("  - " + n)
+        print()
+    print(md_table(*cluster_table(res)))
+    print()
+    for p in written:
+        print("wrote " + p)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

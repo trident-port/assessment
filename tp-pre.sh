@@ -25,6 +25,13 @@
 # Trident node plugin). Nothing is patched or scaled. The file can be handed to
 # their reviewer before it is run.
 #
+# ONE MORE, ALSO OFF UNLESS ASKED FOR, AND THIS ONE CREATES THINGS:
+#   --bench         measure how fast a copy runs here and add the migration-time
+#                   tables to the summary. It runs the sibling script tp-bench.sh
+#                   (a temporary namespace `tp-bench` with small volumes, all of
+#                   it deleted when it ends) and then tp-estimate. Both files
+#                   must sit beside this one. Read BENCH.md first.
+#
 # SECTION G2 writes the machine-readable half: tp-pre-<context>-<date>.json (every
 # claim, workload, Argo/Flux object, operator, node, ...) and .md (the risks, on
 # top, in words), and bundles all four files into one .tgz to send back. A
@@ -53,6 +60,21 @@
 #                                      read-only find in the pod that mounts it)
 #   ./tp-pre.sh --probe-pull           also run a pod to test the image pull (CREATES a
 #                                      pod, then deletes it) - off by default
+#   ./tp-pre.sh --bench --dest-sc <class>
+#                                      also MEASURE copy speed and estimate the time of
+#                                      the migration. CREATES a namespace tp-bench and
+#                                      small volumes in the source classes and in
+#                                      <class>, and deletes them at the end. Needs
+#                                      tp-bench.sh and tp-estimate beside this file.
+#                                      --source-sc a,b limits the source classes (default:
+#                                      every class that holds a claim);
+#                                      --bench-size small|medium|large|<GiB> sets how much
+#                                      test data is written (default medium, about 60 GiB
+#                                      per source class). It states the space and the time
+#                                      first and asks; --yes skips the question;
+#                                      --bench-image IMG names the image with rsync;
+#                                      --bench-args "..." passes more options on
+#                                      (see ./tp-bench.sh --help)
 #   ./tp-pre.sh --read-timeout 600     seconds allowed to each batch read (default 300)
 #   ./tp-pre.sh --node-debug           oc only: when the node plugin has no shell,
 #                                      read the node with a temporary `oc debug node`
@@ -79,6 +101,13 @@ TP_PRINT_INTERNAL=true
 TP_NODE_DEBUG=false
 TP_COUNT_FILES=false
 TP_PROBE_PULL=false
+TP_BENCH=false
+TP_BENCH_DEST=""
+TP_BENCH_SRC=""
+TP_BENCH_IMAGE=""
+TP_BENCH_ARGS=""
+TP_BENCH_SIZE=""
+TP_BENCH_YES=false
 TP_READ_TIMEOUT=300
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -92,6 +121,13 @@ while [ $# -gt 0 ]; do
     --node-debug) TP_NODE_DEBUG=true; shift ;;
     --count-files) TP_COUNT_FILES=true; shift ;;
     --probe-pull) TP_PROBE_PULL=true; shift ;;
+    --bench) TP_BENCH=true; shift ;;
+    --dest-sc) TP_BENCH_DEST="${2:-}"; shift 2 ;;
+    --source-sc) TP_BENCH_SRC="${2:-}"; shift 2 ;;
+    --bench-image) TP_BENCH_IMAGE="${2:-}"; shift 2 ;;
+    --bench-args) TP_BENCH_ARGS="${2:-}"; shift 2 ;;
+    --bench-size) TP_BENCH_SIZE="${2:-}"; shift 2 ;;
+    --yes) TP_BENCH_YES=true; shift ;;
     --read-timeout) TP_READ_TIMEOUT="${2:-300}"; shift 2 ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -224,12 +260,13 @@ TP_OWNERSHIP_CONVENTIONS="postgresql|postgresqls|cluster-name|application=spilo"
 #   pattern can use `|` and the kind list can use `,`:
 #       name;image regex;custom resource kinds;memory-first?;what the hook does
 TP_DATA_ENGINES="
+Artifactory;artifactory;OpenshiftArtifactoryHa;on-disk;NOTHING - the binaries are on the volume, but the metadata is in the database, which is outside the volume unless it is Derby
 PostgreSQL;postgres|spilo|timescale|citus;postgresql,PostgreSQL,Postgresql,PostgresCluster,Cluster;on-disk;LOCKs every table and calls pg_backup_start() before the snapshot
 MySQL;mysql|percona-xtradb;MysqlCluster,MySQLCluster,InnoDBCluster,PerconaXtraDBCluster;on-disk;runs FLUSH TABLES WITH READ LOCK and holds the database read-only across it
 MariaDB;mariadb;MariaDB;on-disk;flushes and read-locks, and NetApp warn that non-InnoDB tables are not even crash-consistent without it
 MongoDB;mongo;MongoDB,MongoDBCommunity,PerconaServerMongoDB;on-disk;calls db.fsyncLock() to push pending writes onto the volume and block new ones
 Cassandra;cassandra|scylla;CassandraDatacenter,ScyllaCluster;on-disk;runs nodetool flush: until it does the memtables are in memory and only the commitlog is on disk
-Elasticsearch;elasticsearch|opensearch;Elasticsearch,OpenSearchCluster;on-disk;flushes every index and sets index.blocks.read_only for the duration
+Elasticsearch;elasticsearch|opensearch;Elasticsearch,Elasticsearch.logging.openshift.io,OpenSearchCluster;on-disk;flushes every index and sets index.blocks.read_only for the duration
 Kafka;kafka;kafka,KafkaNodePool;on-disk;NOTHING - NetApp tested that Kafka restores from a crash-consistent copy and publish no hook for it
 Redis;redis|valkey|dragonfly|keydb;RedisCluster,RedisEnterpriseCluster,Valkey,Dragonfly;memory-first;runs BGSAVE, because until it does the keyspace is in memory and the volume may hold nothing at all
 SQL Server;mssql|sqlserver|sql-server;;on-disk;puts every database into READ_ONLY for the duration of the snapshot
@@ -246,7 +283,7 @@ TP_NOT_THE_ENGINE="exporter|metrics|operator|controller|backup|restore|dump|boun
 #   The kinds the product can stop through a custom resource, in every
 #   spelling it accepts, plus the two kinds it handles
 #   outside the registry (Strimzi's Kafka, KubeVirt's VirtualMachine).
-TP_REGISTRY_OPERATORS="ActiveMQArtemis|Alertmanager|CassandraDatacenter|ClickHouseInstallation|Cluster|CouchbaseCluster|CrdbCluster|Dragonfly|Elasticsearch|EtcdCluster|Hazelcast|InnoDBCluster|Kafka|KafkaNodePool|Keycloak|MariaDB|Milvus|MongoDB|MongoDBCommunity|MySQLCluster|MysqlCluster|NexusRepo|OpenSearchCluster|PerconaServerMongoDB|PerconaXtraDBCluster|PostgreSQL|PostgresCluster|Postgresql|Prometheus|RabbitmqCluster|RedisCluster|RedisEnterpriseCluster|ScyllaCluster|Seaweed|SolrCloud|TemporalCluster|Tenant|TidbCluster|VMCluster|Valkey|VirtualMachine|ZookeeperCluster|activemqartemis|alertmanager|cassandradatacenter|clickhouseinstallation|cluster|couchbasecluster|crdbcluster|dragonfly|elasticsearch|etcdcluster|hazelcast|innodbcluster|kafka|kafkanodepool|keycloak|mariadb|milvus|mongodb|mongodbcommunity|mysqlcluster|nexusrepo|opensearchcluster|perconaservermongodb|perconaxtradbcluster|postgrescluster|postgresql|prometheus|rabbitmqcluster|rediscluster|redisenterprisecluster|scyllacluster|seaweed|solrcloud|temporalcluster|tenant|tidbcluster|valkey|virtualmachine|vmcluster|zookeepercluster"
+TP_REGISTRY_OPERATORS="ActiveMQArtemis|Alertmanager|CassandraDatacenter|ClickHouseInstallation|ClickHouseKeeperInstallation|Cluster|CouchbaseCluster|CrdbCluster|Dragonfly|Elasticsearch|Elasticsearch.logging.openshift.io|EtcdCluster|Hazelcast|InnoDBCluster|Kafka|KafkaNodePool|Keycloak|MariaDB|Milvus|MongoDB|MongoDBCommunity|MySQLCluster|MysqlCluster|NexusRepo|OpenSearchCluster|OpenshiftArtifactoryHa|PerconaServerMongoDB|PerconaXtraDBCluster|PostgreSQL|PostgresCluster|Postgresql|Prometheus|RabbitmqCluster|RedisCluster|RedisEnterpriseCluster|ScyllaCluster|Seaweed|SolrCloud|TemporalCluster|Tenant|TidbCluster|VMCluster|Valkey|VirtualMachine|ZookeeperCluster|activemqartemis|alertmanager|cassandradatacenter|clickhouseinstallation|clickhousekeeperinstallation|cluster|couchbasecluster|crdbcluster|dragonfly|elasticsearch|elasticsearch.logging.openshift.io|etcdcluster|hazelcast|innodbcluster|kafka|kafkanodepool|keycloak|mariadb|milvus|mongodb|mongodbcommunity|mysqlcluster|nexusrepo|opensearchcluster|openshiftartifactoryha|perconaservermongodb|perconaxtradbcluster|postgrescluster|postgresql|prometheus|rabbitmqcluster|rediscluster|redisenterprisecluster|scyllacluster|seaweed|solrcloud|temporalcluster|tenant|tidbcluster|valkey|virtualmachine|vmcluster|zookeepercluster"
 
 #   Of those, the ones whose CRD declares a minimum ABOVE ZERO. Patching the
 #   custom resource to zero is refused by the API server, so there is no stop
@@ -262,14 +299,14 @@ TP_REGISTRY_OPERATORS="ActiveMQArtemis|Alertmanager|CassandraDatacenter|ClickHou
 #   Generated from the product's registry; the drift test fails in
 #   both directions, because a kind missing here is a hot copy nobody warned
 #   about and a kind invented here is a window we asked for and did not need.
-TP_REFUSES_ZERO="CassandraDatacenter|Cluster|CouchbaseCluster|CrdbCluster|InnoDBCluster|KafkaNodePool|MySQLCluster|PostgresCluster|Seaweed|Tenant|TemporalCluster|ZookeeperCluster|cassandradatacenter|cluster|couchbasecluster|crdbcluster|innodbcluster|kafkanodepool|postgrescluster|seaweed|tenant|temporalcluster|zookeepercluster"
+TP_REFUSES_ZERO="Cluster|CouchbaseCluster|CrdbCluster|InnoDBCluster|KafkaNodePool|MongoDBCommunity|MySQLCluster|OpenshiftArtifactoryHa|PostgresCluster|Seaweed|TemporalCluster|Tenant|ZookeeperCluster|cluster|couchbasecluster|crdbcluster|innodbcluster|kafkanodepool|mongodbcommunity|openshiftartifactoryha|postgrescluster|seaweed|temporalcluster|tenant|zookeepercluster"
 
 #   The CRDs section G2 looks for, as Kind=resource pairs: one per entry of
 #   the product's operator registry, plus Strimzi's Kafka, which
 #   it handles outside the registry. A resource with a dot is
 #   plural.group and is matched on both; one without is matched on kind alone.
 #   Generated, not typed: a test fails on drift.
-TP_REGISTRY_CRDS="ActiveMQArtemis=activemqartemises.broker.amq.io;Alertmanager=alertmanagers.monitoring.coreos.com;CassandraDatacenter=cassandradatacenters.cassandra.datastax.com;ClickHouseInstallation=clickhouseinstallations.clickhouse.altinity.com;Cluster=clusters.postgresql.cnpg.io;CouchbaseCluster=couchbaseclusters.couchbase.com;CrdbCluster=crdbcluster;Dragonfly=dragonflies.dragonflydb.io;Elasticsearch=elasticsearches.elasticsearch.k8s.elastic.co;EtcdCluster=etcdclusters.etcd-operator.cozystack.io;Hazelcast=hazelcasts.hazelcast.com;InnoDBCluster=innodbclusters.mysql.oracle.com;KafkaNodePool=kafkanodepool;Keycloak=keycloaks.k8s.keycloak.org;MariaDB=mariadb;Milvus=milvuses.milvus.io;MongoDB=mongodb.mongodb.com;MongoDBCommunity=mongodbcommunity;MySQLCluster=mysqlclusters.moco.cybozu.com;MysqlCluster=mysqlclusters.mysql.presslabs.org;NexusRepo=nexusrepos.sonatype.com;OpenSearchCluster=opensearchclusters.opensearch.org;PerconaServerMongoDB=perconaservermongodbs.psmdb.percona.com;PerconaXtraDBCluster=perconaxtradbclusters.pxc.percona.com;PostgresCluster=postgresclusters.postgres-operator.crunchydata.com;Prometheus=prometheuses.monitoring.coreos.com;RabbitmqCluster=rabbitmqclusters.rabbitmq.com;RedisCluster=redisclusters.redis.redis.opstreelabs.in;RedisEnterpriseCluster=redisenterpriseclusters.app.redislabs.com;ScyllaCluster=scyllaclusters.scylla.scylladb.com;Seaweed=seaweeds.seaweed.seaweedfs.com;SolrCloud=solrclouds.solr.apache.org;TemporalCluster=temporalclusters.temporal.io;Tenant=tenants.minio.min.io;TidbCluster=tidbclusters.pingcap.com;VMCluster=vmclusters.operator.victoriametrics.com;Valkey=valkeys.hyperspike.io;VirtualMachine=virtualmachines.kubevirt.io;ZookeeperCluster=zookeeperclusters.zookeeper.pravega.io;postgresql=postgresql;Kafka=kafkas.kafka.strimzi.io"
+TP_REGISTRY_CRDS="ActiveMQArtemis=activemqartemises.broker.amq.io;Alertmanager=alertmanagers.monitoring.coreos.com;CassandraDatacenter=cassandradatacenters.cassandra.datastax.com;ClickHouseInstallation=clickhouseinstallations.clickhouse.altinity.com;ClickHouseKeeperInstallation=clickhousekeeperinstallations.clickhouse-keeper.altinity.com;Cluster=clusters.postgresql.cnpg.io;CouchbaseCluster=couchbaseclusters.couchbase.com;CrdbCluster=crdbcluster;Dragonfly=dragonflies.dragonflydb.io;Elasticsearch=elasticsearches.elasticsearch.k8s.elastic.co;Elasticsearch.logging.openshift.io=elasticsearches.logging.openshift.io;EtcdCluster=etcdclusters.etcd-operator.cozystack.io;Hazelcast=hazelcasts.hazelcast.com;InnoDBCluster=innodbclusters.mysql.oracle.com;KafkaNodePool=kafkanodepool;Keycloak=keycloaks.k8s.keycloak.org;MariaDB=mariadb;Milvus=milvuses.milvus.io;MongoDB=mongodb.mongodb.com;MongoDBCommunity=mongodbcommunity;MySQLCluster=mysqlclusters.moco.cybozu.com;MysqlCluster=mysqlclusters.mysql.presslabs.org;NexusRepo=nexusrepos.sonatype.com;OpenSearchCluster=opensearchclusters.opensearch.org;OpenshiftArtifactoryHa=openshiftartifactoryhas.charts.helm.k8s.io;PerconaServerMongoDB=perconaservermongodbs.psmdb.percona.com;PerconaXtraDBCluster=perconaxtradbclusters.pxc.percona.com;PostgresCluster=postgresclusters.postgres-operator.crunchydata.com;Prometheus=prometheuses.monitoring.coreos.com;RabbitmqCluster=rabbitmqclusters.rabbitmq.com;RedisCluster=redisclusters.redis.redis.opstreelabs.in;RedisEnterpriseCluster=redisenterpriseclusters.app.redislabs.com;ScyllaCluster=scyllaclusters.scylla.scylladb.com;Seaweed=seaweeds.seaweed.seaweedfs.com;SolrCloud=solrclouds.solr.apache.org;TemporalCluster=temporalclusters.temporal.io;Tenant=tenants.minio.min.io;TidbCluster=tidbclusters.pingcap.com;VMCluster=vmclusters.operator.victoriametrics.com;Valkey=valkeys.hyperspike.io;VirtualMachine=virtualmachines.kubevirt.io;ZookeeperCluster=zookeeperclusters.zookeeper.pravega.io;postgresql=postgresql;Kafka=kafkas.kafka.strimzi.io"
 
 # tp_stop_strategy <kind> <how-many-other-namespaces-hold-this-kind>
 #
@@ -2772,6 +2809,446 @@ def redact_url(url):
     return re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@", r"\1", url)
 
 
+# ── tp-pre blobs: what is kept from Argo CD and the workloads ───────────────
+# Nothing here is a blacklist. Each object is rebuilt from a list of the fields
+# the guide needs, and anything that carries free text (Helm values, plugin
+# env, parameters, generator elements) goes through scrub_obj, which keeps a
+# value ONLY when its key names storage, persistence or a volume claim and does
+# not look like a credential. Everything else becomes REDACTED. Secrets are
+# never read, and annotations are dropped except a short list of prefixes.
+REDACTED = "<redacted>"
+STORAGE_KEY = re.compile(r"storage[-_.]?class|persist|volumeclaim|pvc|claim|storage|volume|accessmode|mountpath", re.I)
+STORAGE_LEAF = {"size", "enabled", "class", "type", "accessmode", "accessmodes", "existingclaim", "mountpath"}
+SECRET_KEY = re.compile(r"pass|secret|token|key|cred|auth|cert|private|bearer|salt|dsn|conn|session|cookie|signature", re.I)
+ANNO_KEEP = ("argocd.argoproj.io/", "meta.helm.sh/", "cluster-autoscaler.kubernetes.io/",
+             "sidecar.istio.io/", "linkerd.io/", "backup.velero.io/")
+MAX_STR = 300
+
+
+def safe_url(value):
+    """Userinfo and token-like query parameters removed from anything URL-shaped."""
+    if not isinstance(value, str):
+        return value
+    out = redact_url(value)
+    out = re.sub(r"([?&;](?:token|access_token|private_token|password|passwd|pwd|secret|key|apikey|api_key|sig|signature)=)[^&;\s]*",
+                 r"\1" + REDACTED, out, flags=re.I)
+    return out if len(out) <= MAX_STR else out[:MAX_STR] + "..."
+
+
+def keep_key(path):
+    leaf = str(path[-1]) if path else ""
+    if not leaf or SECRET_KEY.search(leaf):
+        return False
+    if STORAGE_KEY.search(leaf):
+        return True
+    return leaf.lower() in STORAGE_LEAF and any(STORAGE_KEY.search(str(p)) for p in path[:-1])
+
+
+def scalar_keep(value, path):
+    if value is None:
+        return None
+    if keep_key(path):
+        return safe_url(value) if isinstance(value, str) else value
+    return REDACTED
+
+
+def scrub_obj(node, path=()):
+    path = list(path)
+    if isinstance(node, dict):
+        out = collections.OrderedDict()
+        for k, v in node.items():
+            p = path + [str(k)]
+            out[k] = scrub_obj(v, p) if isinstance(v, (dict, list)) else scalar_keep(v, p)
+        return out
+    if isinstance(node, list):
+        if all(not isinstance(x, (dict, list)) for x in node):
+            return [scalar_keep(x, path) if x is not None else None for x in node]
+        return [scrub_obj(x, path) for x in node]
+    return scalar_keep(node, path)
+
+
+def scrub_namevalue(items):
+    """[{name, value|string|array|map}]: the value stays only if the NAME says storage."""
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", ""))
+        ok = (not SECRET_KEY.search(name)) and bool(STORAGE_KEY.search(name))
+        row = collections.OrderedDict([("name", name)])
+        for k, v in it.items():
+            if k == "name":
+                continue
+            if ok and not isinstance(v, (dict, list)):
+                row[k] = safe_url(v) if isinstance(v, str) else v
+            else:
+                row[k] = REDACTED
+        out.append(row)
+    return out
+
+
+_YKEY = re.compile(r"^(?P<ind>\s*)(?P<dash>(?:-\s+)*)(?P<key>[^\s:#'\"{\[][^:#]*?):(?:\s+(?P<val>.*))?$")
+
+
+def scrub_yaml_text(text):
+    """Helm values as text. Line based, standard library only. Lines it cannot
+    place are dropped and never copied. A value survives only under a storage key."""
+    out, stack, skip = [], [], None
+    for raw in str(text).splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#") or raw.strip() in ("---", "..."):
+            continue
+        ind = len(raw) - len(raw.lstrip(" "))
+        if skip is not None:
+            if ind > skip:
+                continue
+            skip = None
+        m = _YKEY.match(raw)
+        s = raw.strip()
+        if s.startswith("- ") and not m:
+            val = s[2:].strip()
+            while stack and stack[-1][0] >= ind:
+                stack.pop()
+            parent = [k for _, k in stack]
+            keepv = parent and keep_key(parent) and ":" not in val and not val.startswith(("{", "[", "|", ">"))
+            out.append("%s- %s" % (" " * ind, safe_url(val.strip("'\"")) if keepv else REDACTED))
+            continue
+        if not m:
+            continue
+        eff = ind + len(m.group("dash"))
+        key = m.group("key").strip().strip("'\"")
+        val = (m.group("val") or "").strip()
+        while stack and stack[-1][0] >= eff:
+            stack.pop()
+        path = [k for _, k in stack] + [key]
+        pad = " " * ind + m.group("dash")
+        if val == "" or val.startswith("&") and len(val.split()) == 1:
+            out.append("%s%s:" % (pad, key))
+            stack.append((eff, key))
+        elif val[0] in "|>":
+            out.append("%s%s: %s" % (pad, key, REDACTED))
+            skip = eff
+        elif val[0] in "{[":
+            out.append("%s%s: %s" % (pad, key, REDACTED))
+        else:
+            v = val.split(" #")[0].strip().strip("'\"")
+            out.append("%s%s: %s" % (pad, key, safe_url(v) if keep_key(path) else REDACTED))
+    return "\n".join(out)
+
+
+def plain(node):
+    """Structure copied as is, only URLs cleaned and long strings cut."""
+    if isinstance(node, dict):
+        return collections.OrderedDict((k, plain(v)) for k, v in node.items())
+    if isinstance(node, list):
+        return [plain(x) for x in node]
+    return safe_url(node) if isinstance(node, str) else node
+
+
+def pick(d, names):
+    return collections.OrderedDict((k, plain(d[k])) for k in names if isinstance(d, dict) and k in d)
+
+
+def meta_view(o, with_labels=True):
+    m = meta(o)
+    out = collections.OrderedDict()
+    for k in ("name", "namespace", "creationTimestamp", "deletionTimestamp", "finalizers"):
+        if m.get(k) is not None:
+            out[k] = m[k]
+    if with_labels and m.get("labels"):
+        out["labels"] = plain(m["labels"])
+    an = {k: v for k, v in (m.get("annotations") or {}).items() if k.startswith(ANNO_KEEP)}
+    if an:
+        out["annotations"] = plain(an)
+    if m.get("ownerReferences"):
+        out["ownerReferences"] = [pick(r, ("apiVersion", "kind", "name", "controller")) for r in m["ownerReferences"]]
+    return out
+
+
+def ints_of(d):
+    return collections.OrderedDict((k, v) for k, v in (d or {}).items()
+                                   if isinstance(v, int) and not isinstance(v, bool))
+
+
+def source_view(s):
+    out = collections.OrderedDict()
+    if not isinstance(s, dict):
+        return out
+    if "repoURL" in s:
+        out["repoURL"] = safe_url(s["repoURL"])
+    out.update(pick(s, ("path", "chart", "targetRevision", "ref", "name")))
+    h = s.get("helm")
+    if isinstance(h, dict):
+        hv = pick(h, ("releaseName", "valueFiles", "skipCrds", "passCredentials", "ignoreMissingValueFiles",
+                      "version", "namespace", "kubeVersion", "apiVersions"))
+        if "values" in h:
+            hv["values"] = scrub_yaml_text(h["values"]) if isinstance(h["values"], str) else scrub_obj(h["values"])
+        if "valuesObject" in h:
+            hv["valuesObject"] = scrub_obj(h["valuesObject"])
+        if "parameters" in h:
+            hv["parameters"] = scrub_namevalue(h["parameters"])
+        if "fileParameters" in h:
+            hv["fileParameters"] = [pick(x, ("name", "path")) for x in h["fileParameters"] if isinstance(x, dict)]
+        for k in h:
+            if k not in hv and k not in ("values", "valuesObject", "parameters", "fileParameters"):
+                hv[k] = scrub_obj(h[k], [k])
+        out["helm"] = hv
+    k = s.get("kustomize")
+    if isinstance(k, dict):
+        kv = pick(k, ("namePrefix", "nameSuffix", "namespace", "version", "forceCommonLabels",
+                      "forceCommonAnnotations", "images", "replicas"))
+        for kk in k:
+            if kk not in kv:
+                kv[kk] = scrub_obj(k[kk], [kk])
+        out["kustomize"] = kv
+    d = s.get("directory")
+    if isinstance(d, dict):
+        dv = pick(d, ("recurse", "include", "exclude"))
+        j = d.get("jsonnet")
+        if isinstance(j, dict):
+            dv["jsonnet"] = collections.OrderedDict([("libs", plain(j.get("libs"))),
+                                                     ("tlas", scrub_namevalue(j.get("tlas"))),
+                                                     ("extVars", scrub_namevalue(j.get("extVars")))])
+        out["directory"] = dv
+    p = s.get("plugin")
+    if isinstance(p, dict):
+        out["plugin"] = collections.OrderedDict([("name", p.get("name")), ("env", scrub_namevalue(p.get("env"))),
+                                                 ("parameters", scrub_namevalue(p.get("parameters")))])
+    for kk in s:
+        if kk not in out and kk not in ("helm", "kustomize", "directory", "plugin"):
+            out[kk] = scrub_obj(s[kk], [kk])
+    return out
+
+
+def app_spec_view(spec):
+    spec = spec if isinstance(spec, dict) else {}
+    out = collections.OrderedDict()
+    out["project"] = spec.get("project")
+    if "source" in spec:
+        out["source"] = source_view(spec["source"])
+    if "sources" in spec:
+        out["sources"] = [source_view(x) for x in spec["sources"] or []]
+    dest = spec.get("destination") or {}
+    out["destination"] = collections.OrderedDict([("server", safe_url(dest.get("server"))), ("name", dest.get("name")),
+                                                  ("namespace", dest.get("namespace"))])
+    pol = spec.get("syncPolicy")
+    if isinstance(pol, dict):
+        pv = pick(pol, ("automated", "syncOptions", "retry"))
+        if "managedNamespaceMetadata" in pol:
+            pv["managedNamespaceMetadata"] = scrub_obj(pol["managedNamespaceMetadata"])
+        out["syncPolicy"] = pv
+    if "ignoreDifferences" in spec:
+        out["ignoreDifferences"] = plain(spec["ignoreDifferences"])
+    if "info" in spec:
+        out["info"] = scrub_namevalue(spec["info"])
+    out.update(pick(spec, ("revisionHistoryLimit",)))
+    return out
+
+
+def app_view(a):
+    st = a.get("status") or {}
+    return collections.OrderedDict([
+        ("metadata", meta_view(a)),
+        ("spec", app_spec_view(a.get("spec"))),
+        ("status", collections.OrderedDict([
+            ("sync", pick(st.get("sync") or {}, ("status", "revision"))),
+            ("health", pick(st.get("health") or {}, ("status",))),
+            ("sourceType", st.get("sourceType")), ("sourceTypes", st.get("sourceTypes")),
+            ("reconciledAt", st.get("reconciledAt")),
+            ("operationState", pick(st.get("operationState") or {}, ("phase", "startedAt", "finishedAt"))),
+            ("resources", [collections.OrderedDict(
+                [("group", r.get("group")), ("kind", r.get("kind")), ("namespace", r.get("namespace")),
+                 ("name", r.get("name")), ("status", r.get("status")),
+                 ("health", (r.get("health") or {}).get("status")), ("hook", r.get("hook"))])
+                for r in st.get("resources") or [] if isinstance(r, dict)]),
+            ("conditions", [pick(c, ("type", "lastTransitionTime")) for c in st.get("conditions") or [] if isinstance(c, dict)]),
+            ("history", [pick(h, ("id", "revision", "deployedAt")) for h in st.get("history") or [] if isinstance(h, dict)]),
+        ])),
+    ])
+
+
+GEN_URL = ("repoURL", "url", "apiURL")
+GEN_SAFE = ("revision", "path", "pathParamPrefix", "requeueAfterSeconds", "namespace", "name", "exclude",
+            "recursive", "labels", "project", "owner", "repo", "branch", "selector", "matchLabels",
+            "matchExpressions", "operator", "mergeKeys", "limit")
+
+
+def gen_view(g):
+    """Generators. Structure and locations are kept, free-form parameters are scrubbed."""
+    if isinstance(g, list):
+        return [gen_view(x) for x in g]
+    if not isinstance(g, dict):
+        return plain(g)
+    out = collections.OrderedDict()
+    for k, v in g.items():
+        if k in GEN_URL:
+            out[k] = safe_url(v)
+        elif k == "template":
+            out[k] = template_view(v)
+        elif k in ("elements", "values", "params", "parameters", "input"):
+            out[k] = scrub_obj(v, [k])
+        elif isinstance(v, (dict, list)):
+            out[k] = gen_view(v)
+        elif k in GEN_SAFE:
+            out[k] = plain(v)
+        else:
+            out[k] = scrub_obj(v, [k])
+    return out
+
+
+def template_view(t):
+    t = t if isinstance(t, dict) else {}
+    return collections.OrderedDict([("metadata", meta_view(t)), ("spec", app_spec_view(t.get("spec")))])
+
+
+def appset_view(s):
+    spec = s.get("spec") or {}
+    sp = collections.OrderedDict()
+    sp["goTemplate"] = spec.get("goTemplate")
+    sp["generators"] = [gen_view(g) for g in spec.get("generators") or []]
+    sp["template"] = template_view(spec.get("template"))
+    if "templatePatch" in spec:
+        sp["templatePatch"] = REDACTED
+    pol = spec.get("syncPolicy")
+    if isinstance(pol, dict):
+        sp["syncPolicy"] = pick(pol, ("preserveResourcesOnDeletion", "applicationsSync"))
+    if "strategy" in spec:
+        sp["strategy"] = scrub_obj(spec["strategy"])
+    st = s.get("status") or {}
+    return collections.OrderedDict([
+        ("metadata", meta_view(s)), ("spec", sp),
+        ("status", collections.OrderedDict([
+            ("conditions", [pick(c, ("type", "status")) for c in st.get("conditions") or [] if isinstance(c, dict)]),
+            ("applicationStatus", [pick(x, ("application", "status")) for x in st.get("applicationStatus") or [] if isinstance(x, dict)]),
+        ])),
+    ])
+
+
+def project_view(p):
+    spec = p.get("spec") or {}
+    sp = pick(spec, ("description", "sourceNamespaces", "clusterResourceWhitelist", "clusterResourceBlacklist",
+                     "namespaceResourceWhitelist", "namespaceResourceBlacklist", "orphanedResources", "syncWindows"))
+    sp["sourceRepos"] = [safe_url(x) for x in spec.get("sourceRepos") or []]
+    sp["destinations"] = [collections.OrderedDict([("server", safe_url(d.get("server"))), ("name", d.get("name")),
+                                                   ("namespace", d.get("namespace"))])
+                          for d in spec.get("destinations") or [] if isinstance(d, dict)]
+    sp["roles"] = [pick(r, ("name", "description", "policies", "groups")) for r in spec.get("roles") or [] if isinstance(r, dict)]
+    sp["signature_keys_count"] = len(spec.get("signatureKeys") or [])
+    return collections.OrderedDict([("metadata", meta_view(p)), ("spec", sp)])
+
+
+def pod_spec_view(ps):
+    ps = ps if isinstance(ps, dict) else {}
+    out = pick(ps, ("nodeSelector", "serviceAccountName", "hostNetwork", "hostPID", "priorityClassName", "schedulerName",
+                    "terminationGracePeriodSeconds", "runtimeClassName", "tolerations", "topologySpreadConstraints", "affinity"))
+    sc = ps.get("securityContext")
+    if isinstance(sc, dict):
+        out["securityContext"] = pick(sc, ("runAsUser", "runAsGroup", "fsGroup", "fsGroupChangePolicy", "runAsNonRoot",
+                                           "supplementalGroups"))
+    vols = []
+    for v in ps.get("volumes") or []:
+        if not isinstance(v, dict):
+            continue
+        kinds = [k for k in v if k != "name"]
+        e = collections.OrderedDict([("name", v.get("name")), ("type", kinds[0] if kinds else None)])
+        pvc = v.get("persistentVolumeClaim")
+        if isinstance(pvc, dict):
+            e["claimName"] = pvc.get("claimName")
+        eph = (v.get("ephemeral") or {}).get("volumeClaimTemplate") if isinstance(v.get("ephemeral"), dict) else None
+        if isinstance(eph, dict):
+            e["storageClassName"] = (eph.get("spec") or {}).get("storageClassName")
+        vols.append(e)
+    out["volumes"] = vols
+    for field in ("containers", "initContainers"):
+        rows = []
+        for c in ps.get(field) or []:
+            if not isinstance(c, dict):
+                continue
+            res = c.get("resources") or {}
+            rows.append(collections.OrderedDict([
+                ("name", c.get("name")), ("image", safe_url(c.get("image"))),
+                ("volumeMounts", [pick(m, ("name", "mountPath", "subPath", "readOnly"))
+                                  for m in c.get("volumeMounts") or [] if isinstance(m, dict)]),
+                ("resources", collections.OrderedDict([(k, plain(res.get(k))) for k in ("requests", "limits") if res.get(k)])),
+            ]))
+        out[field] = rows
+    return out
+
+
+def vct_view(v):
+    sp = v.get("spec") or {}
+    return collections.OrderedDict([
+        ("name", meta(v).get("name")), ("labels", plain(meta(v).get("labels") or {})),
+        ("storageClassName", sp.get("storageClassName")), ("accessModes", sp.get("accessModes")),
+        ("storage", ((sp.get("resources") or {}).get("requests") or {}).get("storage")),
+        ("volumeMode", sp.get("volumeMode")),
+    ])
+
+
+def tmpl_view(t):
+    t = t if isinstance(t, dict) else {}
+    out = collections.OrderedDict()
+    out["labels"] = plain(meta(t).get("labels") or {})
+    an = {k: v for k, v in (meta(t).get("annotations") or {}).items() if k.startswith(ANNO_KEEP)}
+    if an:
+        out["annotations"] = plain(an)
+    out["spec"] = pod_spec_view(t.get("spec"))
+    return out
+
+
+def workload_view(o):
+    spec = o.get("spec") or {}
+    st = o.get("status") or {}
+    sp = pick(spec, ("replicas", "selector", "serviceName", "podManagementPolicy", "updateStrategy", "strategy",
+                     "minReadySeconds", "persistentVolumeClaimRetentionPolicy", "schedule", "suspend",
+                     "concurrencyPolicy", "startingDeadlineSeconds", "timeZone", "parallelism", "completions",
+                     "backoffLimit", "activeDeadlineSeconds", "ttlSecondsAfterFinished", "completionMode"))
+    if "template" in spec:
+        sp["template"] = tmpl_view(spec["template"])
+    jt = (spec.get("jobTemplate") or {}).get("spec")
+    if isinstance(jt, dict):
+        sp["jobTemplate"] = collections.OrderedDict([("spec", collections.OrderedDict([
+            ("parallelism", jt.get("parallelism")), ("completions", jt.get("completions")),
+            ("template", tmpl_view(jt.get("template")))]))])
+    if spec.get("volumeClaimTemplates") is not None:
+        sp["volumeClaimTemplates"] = [vct_view(v) for v in spec["volumeClaimTemplates"] or [] if isinstance(v, dict)]
+    stv = ints_of(st)
+    if isinstance(st.get("active"), list):
+        stv["active"] = len(st["active"])
+    if st.get("lastScheduleTime"):
+        stv["lastScheduleTime"] = st["lastScheduleTime"]
+    return collections.OrderedDict([("kind", o.get("kind")), ("metadata", meta_view(o)), ("spec", sp), ("status", stv)])
+
+
+def hpa_view(o):
+    return collections.OrderedDict([("metadata", meta_view(o)),
+                                    ("spec", pick(o.get("spec") or {}, ("scaleTargetRef", "minReplicas", "maxReplicas", "metrics", "behavior"))),
+                                    ("status", ints_of(o.get("status")))])
+
+
+def pdb_view(o):
+    return collections.OrderedDict([("metadata", meta_view(o)),
+                                    ("spec", pick(o.get("spec") or {}, ("minAvailable", "maxUnavailable", "selector", "unhealthyPodEvictionPolicy"))),
+                                    ("status", ints_of(o.get("status")))])
+
+
+def blob_of(res, view, source):
+    """ok | not-installed | unknown are three different answers, never one empty list."""
+    out = collections.OrderedDict([("source", source)])
+    if res.ok:
+        out["status"] = "ok"
+        out["count"] = len(res.items)
+        out["items"] = [view(x) for x in res.items]
+    elif res.status == "absent":
+        out["status"] = "not-installed"
+        out["reason"] = "the API has no such resource type"
+        out["items"] = []
+    else:
+        out["status"] = "unknown"
+        out["reason"] = res.reason
+        out["items"] = []
+    return out
+
+
 def group_of(api_version):
     api_version = api_version or ""
     return api_version.split("/")[0] if "/" in api_version else ""
@@ -2852,6 +3329,14 @@ PERMS = [
     ("list nodes.metrics.k8s.io (metrics API)", "list", "nodes.metrics.k8s.io", "none"),
     ("list statefulsets -A", "list", "statefulsets.apps", None),
     ("list applications.argoproj.io -A", "list", "applications.argoproj.io", None),
+    ("list applicationsets.argoproj.io -A", "list", "applicationsets.argoproj.io", None),
+    ("list appprojects.argoproj.io -A", "list", "appprojects.argoproj.io", None),
+    ("list deployments.apps -A", "list", "deployments.apps", None),
+    ("list daemonsets.apps -A", "list", "daemonsets.apps", None),
+    ("list cronjobs.batch -A", "list", "cronjobs.batch", None),
+    ("list jobs.batch -A", "list", "jobs.batch", None),
+    ("list horizontalpodautoscalers.autoscaling -A", "list", "horizontalpodautoscalers.autoscaling", None),
+    ("list poddisruptionbudgets.policy -A", "list", "poddisruptionbudgets.policy", None),
     ("create pods/exec (only for --count-files)", "create", "pods/exec", None),
 ]
 perms = []
@@ -2890,6 +3375,9 @@ R["routes"] = kget("routes", "routes.route.openshift.io")
 R["apps"] = kget("argo_applications", "applications.argoproj.io")
 R["appsets"] = kget("argo_applicationsets", "applicationsets.argoproj.io")
 R["argocd_cr"] = kget("argo_argocd_cr", "argocds.argoproj.io")
+R["appprojects"] = kget("argo_appprojects", "appprojects.argoproj.io")
+R["hpa"] = kget("horizontalpodautoscalers", "horizontalpodautoscalers.autoscaling")
+R["pdb"] = kget("poddisruptionbudgets", "poddisruptionbudgets.policy")
 R["fx_ks"] = kget("flux_kustomizations", "kustomizations.kustomize.toolkit.fluxcd.io")
 R["fx_hr"] = kget("flux_helmreleases", "helmreleases.helm.toolkit.fluxcd.io")
 R["fx_git"] = kget("flux_gitrepositories", "gitrepositories.source.toolkit.fluxcd.io")
@@ -3409,14 +3897,14 @@ if R["apps"].ok:
             ("namespace", ns), ("name", name), ("project", spec.get("project")),
             ("source_kinds", [src_kind(s) for s in srcs] or ["unknown: no source"]),
             ("multi_source", len(srcs) > 1),
-            ("sources", [{"kind": src_kind(s), "repo": redact_url(s.get("repoURL")), "path": s.get("path"),
+            ("sources", [{"kind": src_kind(s), "repo": safe_url(s.get("repoURL")), "path": s.get("path"),
                           "chart": s.get("chart"), "target_revision": s.get("targetRevision")} for s in srcs]),
             ("sync_policy", {"automated": auto is not None, "self_heal": bool((auto or {}).get("selfHeal")),
                              "prune": bool((auto or {}).get("prune")), "sync_options": pol.get("syncOptions") or []}),
             ("generated_by_applicationset", gen),
             ("is_app_of_apps", kinds_h.get("Application", 0) > 0),
             ("child_applications", kinds_h.get("Application", 0)),
-            ("destination", {"server": redact_url(dest.get("server")), "name": dest.get("name"), "namespace": dest.get("namespace")}),
+            ("destination", {"server": safe_url(dest.get("server")), "name": dest.get("name"), "namespace": dest.get("namespace")}),
             ("managed_namespaces", sorted(set(res_ns) | ({dest.get("namespace")} if dest.get("namespace") else set()))),
             ("managed_resources", len(res) if res else "unknown: status.resources empty or not reported"),
             ("manages_kinds", dict(kinds_h.most_common(12))),
@@ -3481,7 +3969,7 @@ fx_hr = [collections.OrderedDict([
     ("source", "%s/%s" % ((((h.get("spec") or {}).get("chart") or {}).get("spec") or {}).get("sourceRef", {}).get("kind"),
                           (((h.get("spec") or {}).get("chart") or {}).get("spec") or {}).get("sourceRef", {}).get("name"))),
     ("target_namespace", (h.get("spec") or {}).get("targetNamespace")), ("suspended", bool((h.get("spec") or {}).get("suspend")))]) for h in L("fx_hr")]
-fx_git = [{"namespace": key(g)[0], "name": key(g)[1], "url": redact_url((g.get("spec") or {}).get("url")),
+fx_git = [{"namespace": key(g)[0], "name": key(g)[1], "url": safe_url((g.get("spec") or {}).get("url")),
            "branch": ((g.get("spec") or {}).get("ref") or {}).get("branch")} for g in L("fx_git")]
 inv["gitops"]["flux"] = collections.OrderedDict([
     ("kustomizations", fx_ks if R["fx_ks"].ok else R["fx_ks"].say("not installed")),
@@ -3693,6 +4181,22 @@ inv["operators"] = collections.OrderedDict([
      if R["crd"].ok else R["crd"].reason),
 ])
 
+# ── 13b. the blobs: raw-enough, redacted data for generating a guide ───────
+inv["blobs_schema"] = "tp-pre-blobs/1"
+inv["blobs"] = collections.OrderedDict([
+    ("argocd-applications", blob_of(R["apps"], app_view, "%s get applications.argoproj.io -A -o json" % K)),
+    ("argocd-applicationsets", blob_of(R["appsets"], appset_view, "%s get applicationsets.argoproj.io -A -o json" % K)),
+    ("argocd-appprojects", blob_of(R["appprojects"], project_view, "%s get appprojects.argoproj.io -A -o json" % K)),
+    ("workloads", collections.OrderedDict([
+        ("deployments", blob_of(R["deploy"], workload_view, "%s get deployments.apps -A -o json" % K)),
+        ("statefulsets", blob_of(R["sts"], workload_view, "%s get statefulsets.apps -A -o json" % K)),
+        ("daemonsets", blob_of(R["ds"], workload_view, "%s get daemonsets.apps -A -o json" % K)),
+        ("cronjobs", blob_of(R["cronjob"], workload_view, "%s get cronjobs.batch -A -o json" % K)),
+        ("jobs", blob_of(R["job"], workload_view, "%s get jobs.batch -A -o json" % K)),
+        ("horizontalpodautoscalers", blob_of(R["hpa"], hpa_view, "%s get horizontalpodautoscalers.autoscaling -A -o json" % K)),
+        ("poddisruptionbudgets", blob_of(R["pdb"], pdb_view, "%s get poddisruptionbudgets.policy -A -o json" % K)),
+    ])),
+])
 inv["sections"] = SECTIONS
 inv["pvcs"] = rows if R["pvc"].ok else R["pvc"].reason
 inv["statefulsets_with_volume_claim_templates"] = sts_rows if R["sts"].ok else R["sts"].reason
@@ -4167,6 +4671,97 @@ TP_I_LOOP
   }
 fi
 
+# ============================================================================
+# J. MIGRATION TIMES. Only with --bench; otherwise one hint.
+#
+# tp-bench.sh does the writing (a temporary namespace, deleted by name when it
+# ends); this file only starts it. tp-estimate then reads the inventory just
+# written and the measurement, and its tables are added to the summary, so the
+# report that goes back is one report.
+# ============================================================================
+tp_hint_bench() {
+  cat <<'TP_HINT'
+Want approximate migration times as well?
+  Run: ./tp-pre.sh --bench --dest-sc <your Trident class>
+  It creates a temporary namespace tp-bench with small volumes in each source
+  class and in the destination class, and deletes all of it when it ends.
+  It states the space and the time first and asks before it starts.
+  Expect from one hour to many, depending on the storage and the size.
+TP_HINT
+}
+TP_BENCH_FILES=""
+if $TP_BENCH; then
+  sec "J. MIGRATION TIMES - measured on this cluster, then estimated"
+  TP_HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+  TP_BENCH_OK=true
+  if [ ! -f "$TP_HERE/tp-bench.sh" ] || [ ! -f "$TP_HERE/tp-estimate" ]; then
+    echo "   NOT RUN: tp-bench.sh and tp-estimate must sit in the same directory as tp-pre.sh."
+    echo "   Download both next to it and run this again."
+    TP_BENCH_OK=false
+  elif [ ! -f "$INV_JSON" ]; then
+    echo "   NOT RUN: the inventory above was not written, so there is nothing to estimate."
+    echo "   It needs python3. Install it and run this again."
+    TP_BENCH_OK=false
+  elif [ -z "$TP_BENCH_DEST" ]; then
+    TP_TR=$($K get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.provisioner}{"\n"}{end}' 2>/dev/null | awk '$2=="csi.trident.netapp.io"{print $1}' | paste -sd, -)
+    if [ -n "$TP_TR" ]; then
+      echo "   NOT RUN: --bench needs the destination class. Classes served by Trident here: $TP_TR"
+      echo "   Run: ./tp-pre.sh --bench --dest-sc <one of them>"
+    else
+      echo "   NOT RUN: --bench needs the destination class, and this cluster has no class served by Trident yet."
+      echo "   Create the destination backend and its StorageClass first, then run:"
+      echo "   ./tp-pre.sh --bench --dest-sc <that class>"
+    fi
+    TP_BENCH_OK=false
+  fi
+  if $TP_BENCH_OK; then
+    if [ -z "$TP_BENCH_SRC" ]; then
+      TP_BENCH_SRC=$(TP_J="$INV_JSON" TP_D="$TP_BENCH_DEST" python3 -c '
+import json, os
+rows = json.load(open(os.environ["TP_J"])).get("pvcs")
+rows = rows if isinstance(rows, list) else []
+print(",".join(sorted({r.get("storage_class") for r in rows
+      if isinstance(r.get("storage_class"), str) and not r["storage_class"].startswith("unknown")
+      and r["storage_class"] != os.environ["TP_D"]})))' 2>/dev/null)
+    fi
+    if [ -z "$TP_BENCH_SRC" ]; then
+      echo "   NOT RUN: no source class found in the inventory. Name them: --source-sc <class>[,<class>]"
+    else
+      TP_BENCH_IMG_ARG=""
+      [ -n "$TP_BENCH_IMAGE" ] && TP_BENCH_IMG_ARG="--image $TP_BENCH_IMAGE"
+      [ -n "$TP_BENCH_SIZE" ] && TP_BENCH_IMG_ARG="$TP_BENCH_IMG_ARG --size $TP_BENCH_SIZE"
+      $TP_BENCH_YES && TP_BENCH_IMG_ARG="$TP_BENCH_IMG_ARG --yes"
+      echo "   source classes: $TP_BENCH_SRC    destination class: $TP_BENCH_DEST"
+      # shellcheck disable=SC2086
+      bash "$TP_HERE/tp-bench.sh" --bench --source-sc "$TP_BENCH_SRC" --dest-sc "$TP_BENCH_DEST" --out-dir . $TP_BENCH_IMG_ARG $TP_BENCH_ARGS
+      TP_BENCH_RC=$?
+      TP_BENCH_JSON=$(ls -t "tp-bench-${CTX}-"*.json 2>/dev/null | head -n 1)
+      if [ "$TP_BENCH_RC" -ne 0 ] || [ -z "$TP_BENCH_JSON" ]; then
+        echo "   The measurement did not finish (exit $TP_BENCH_RC). No times were estimated."
+        echo "   The namespace tp-bench is removed. The text above says why."
+      else
+        TP_EST="tp-estimate-${CTX}-${STAMP}"
+        if python3 "$TP_HERE/tp-estimate" --assessment "$INV_JSON" --bench "$TP_BENCH_JSON" --out "$TP_EST"; then
+          TP_BENCH_FILES="$TP_BENCH_JSON ${TP_BENCH_JSON%.json}.md ${TP_EST}.md ${TP_EST}-volumes.csv ${TP_EST}-namespaces.csv ${TP_EST}-cluster.csv ${TP_EST}.xlsx"
+          if [ -f "$INV_MD" ] && [ -f "${TP_EST}.md" ]; then
+            { echo; echo "## Migration times"; echo
+              echo "Measured on this cluster by tp-bench.sh (\`$TP_BENCH_JSON\`), then estimated by tp-estimate."
+              echo
+              sed '1,/^## Whole cluster/{/^## Whole cluster/!d}' "${TP_EST}.md" | sed 's/^## /### /'; } >> "$INV_MD"
+          fi
+        else
+          echo "   tp-estimate failed. The measurement is kept: $TP_BENCH_JSON"
+          TP_BENCH_FILES="$TP_BENCH_JSON ${TP_BENCH_JSON%.json}.md"
+        fi
+      fi
+    fi
+  fi
+else
+  if [ -f "$INV_MD" ]; then { echo; tp_hint_bench | sed 's/^Want/## Want/;s/^  /    /'; } >> "$INV_MD"; fi
+  echo
+  tp_hint_bench
+fi
+
 
 hr
 echo "  report:  $OUT"
@@ -4176,7 +4771,7 @@ echo "  csv:     $CSV   (one row per claim, for planning waves)"
 # the report is still being flushed through tee; give it a moment, then bundle
 sync; sleep 1
 TP_BUNDLE=""
-for f in "$OUT" "$CSV" "$INV_JSON" "$INV_MD"; do [ -f "$f" ] && TP_BUNDLE="$TP_BUNDLE $f"; done
+for f in "$OUT" "$CSV" "$INV_JSON" "$INV_MD" $TP_BENCH_FILES; do [ -f "$f" ] && TP_BUNDLE="$TP_BUNDLE $f"; done
 # shellcheck disable=SC2086
 if tar czf "$TGZ" $TP_BUNDLE 2>/dev/null; then
   echo "  SEND:    $TGZ   ($(du -h "$TGZ" | cut -f1))"

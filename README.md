@@ -4,7 +4,7 @@
 the first step of planning a move of persistent volumes to NetApp Trident. It
 produces a report; you send us the report; nothing is installed.
 
-Version: v1.2.2
+Version: v1.2.12
 
 ## What it does
 
@@ -32,9 +32,21 @@ Options that do more are **off unless you ask**:
 
 | Option | What it adds |
 |---|---|
-| `--probe-pull` | Creates one throwaway pod, `tp-pull-probe`, to test an image pull, then deletes it. This is the only option that creates an object. |
+| `--probe-pull` | Creates one throwaway pod, `tp-pull-probe`, to test an image pull, then deletes it. This is the only option of `tp-pre.sh` that creates an object. |
 | `--count-files` | Counts files per claim with a bounded read-only `find`, run with `kubectl exec` in the pod that already mounts the claim. |
+| `--bench` | Measures copy speed and adds the migration-time tables to the summary. **It creates things**: a temporary namespace `tp-bench` with small volumes in your source classes and in the destination class, and runs a few pods in it. It deletes all of it by name when it ends, also when you interrupt it. Needs `--dest-sc <class>`. Read `BENCH.md` first. |
 | `--node-debug` | OpenShift only: reads a node through a temporary `oc debug node` pod, which `oc` removes on exit. |
+
+## Measuring copy speed (optional, creates things)
+
+`bash tp-pre.sh --bench --dest-sc <your Trident class>` also measures how fast a
+copy runs on your cluster, and adds tables of how long the migration would take
+to the summary. For that it runs `tp-bench.sh`, which creates a namespace called
+`tp-bench` with small test volumes, and `tp-estimate`, which reads the two
+result files. Both files must sit beside `tp-pre.sh`. The namespace is deleted
+when it ends. Nothing is created unless you pass `--bench`.
+Read `BENCH.md` before you run it. It lists what is created, what is deleted
+and what permissions it needs.
 
 ## Requirements
 
@@ -47,6 +59,9 @@ Options that do more are **off unless you ask**:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/trident-port/assessment/main/tp-pre.sh
+curl -fsSLO https://raw.githubusercontent.com/trident-port/assessment/main/tp-bench.sh
+curl -fsSLO https://raw.githubusercontent.com/trident-port/assessment/main/tp-estimate
+curl -fsSLO https://raw.githubusercontent.com/trident-port/assessment/main/BENCH.md
 curl -fsSLO https://raw.githubusercontent.com/trident-port/assessment/main/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 bash tp-pre.sh
@@ -64,7 +79,8 @@ never placed on the command line.
 
 The archive `tp-pre-<context>-<date>.tgz` in the current directory. It holds
 the report (`.txt`), the planning table (`.csv`), and the machine-readable
-inventory (`.json`) with its summary (`.md`). Open them first if you want to
+inventory (`.json`) with its summary (`.md`). With `--bench` it also holds the
+measurement and the estimate. Open them first if you want to
 check what leaves.
 
 ## Options
@@ -76,6 +92,14 @@ check what leaves.
 --probe-pull           also test an image pull (creates and deletes one pod)
 --read-timeout N       seconds allowed to each batch read (default 300)
 --node-debug           oc only: read nodes through a temporary debug pod
+--bench                also measure copy speed and estimate times (CREATES a
+                       namespace tp-bench, deleted at the end; read BENCH.md)
+--dest-sc CLASS        the destination class for --bench
+--source-sc A,B        source classes for --bench (default: every class with a claim)
+--bench-size SIZE      small, medium (default) or large, or a number of GiB of
+                       test data per source class, for --bench
+--yes                  do not ask for confirmation before --bench starts
+--bench-image IMAGE    image with rsync for --bench
 -h, --help             show the header of the script
 ```
 
