@@ -401,6 +401,39 @@ tp_operator_owners() {
     --arg ourkind "$TP_OUR_OWN_KIND" --arg ourgroup "$TP_OUR_OWN_GROUP" \
     --argjson want "$_want" 2>/dev/null | sort -u
 
+  # PODS WHOSE CONTROLLER IS A CUSTOM RESOURCE. Some operators run their pods
+  # through a resource of their own (a pod set) that is neither a Deployment
+  # nor a StatefulSet, so the pass above never sees it, and the namespace was
+  # called operator-free. Each such pod that holds a claim is followed up its
+  # ownerReferences, through custom resources only, to the last owner that can
+  # be read, which is the resource the user wrote. Only for claim holders.
+  if [ "$_want" = true ]; then
+    _pjson=$($K get pods -n "$_ns" -o json 2>/dev/null)
+    if [ -n "$_pjson" ]; then
+      printf '%s' "$_pjson" | jq -r "$TP_JQ_OWNERS"'
+        .items[]? | select([(.spec.volumes // [])[] | select(.persistentVolumeClaim)] | length > 0)
+        | tp_operator_refs | "\(.apiVersion)\t\(.kind)\t\(.name)"' 2>/dev/null | sort -u \
+      | while IFS=$'\t' read -r _av _ok _on; do
+          [ -n "$_ok" ] || continue
+          _hops=0
+          while [ "$_hops" -lt 4 ]; do
+            _grp=${_av%%/*}; [ "$_grp" = "$_av" ] && _grp=""
+            _up=$($K get "$_ok.$_grp" "$_on" -n "$_ns" -o json 2>/dev/null | jq -r "$TP_JQ_OWNERS"'
+              ([(.items[]? // .) | tp_operator_refs] | first) // empty
+              | "\(.apiVersion)\t\(.kind)\t\(.name)"' 2>/dev/null)
+            [ -n "$_up" ] || break
+            IFS=$'\t' read -r _av _ok _on <<TP_UP
+$_up
+TP_UP
+            _hops=$((_hops + 1))
+          done
+          _how="owns it"
+          [ "$_ok" = "$TP_OUR_OWN_KIND" ] && [ "${_av%%/*}" = "$TP_OUR_OWN_GROUP" ] && _how="ours"
+          printf '%s\t%s\t%s\n' "$_ok" "$_on" "$_how"
+        done | sort -u
+    fi
+  fi
+
   while IFS='|' read -r _kind _res _label _req; do
     [ -n "$_kind" ] || continue
     # Only workloads that no operator owns: one that already has an owner was
@@ -640,30 +673,55 @@ echo "-- Trident --"
 #   an orchestrator or a controller      -> TRIDENT IS INSTALLED
 #   a list that could not be read        -> unknown, never "not installed"
 # Every read is a plain `get`, in every namespace.
-TP_T_DEPLOYS=$($K get deploy -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image 2>/dev/null); TP_T_RC=$?
+TP_T_ERR=$(mktemp 2>/dev/null || echo /dev/null)
+TP_T_DEPLOYS=$($K get deploy -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image 2>"$TP_T_ERR"); TP_T_RC=$?
+# Why a read failed, in one line, from what kubectl itself said.
+tp_t_why() { tail -n 1 "$TP_T_ERR" 2>/dev/null | cut -c1-160; }
+TP_T_DEPLOYS_WHY=""; [ "$TP_T_RC" -ne 0 ] && TP_T_DEPLOYS_WHY=$(tp_t_why)
 TP_T_OPERATOR=$(printf '%s\n' "$TP_T_DEPLOYS" | awk 'index(tolower($2), "trident-operator") || index(tolower($3), "trident-operator") {print}')
 TP_T_CONTROLLER=$(printf '%s\n' "$TP_T_DEPLOYS" | awk '$2 == "trident-controller" {print}')
-TP_T_CRD=false
-$K get crd tridentorchestrators.trident.netapp.io >/dev/null 2>&1 && TP_T_CRD=true
+# The CRD read has three outcomes: found, NotFound (it is not there), or failed
+# for another reason (RBAC, an unreachable API). Only the second is an absence.
+TP_T_CRD=false; TP_T_CRD_UNREAD=false; TP_T_ORCH_WHY=""
+if $K get crd tridentorchestrators.trident.netapp.io >/dev/null 2>"$TP_T_ERR"; then
+  TP_T_CRD=true
+elif ! grep -qi 'notfound\|not found' "$TP_T_ERR" 2>/dev/null; then
+  TP_T_CRD_UNREAD=true; TP_T_ORCH_WHY=$(tp_t_why)
+fi
 TP_T_ORCH=""; TP_T_ORCH_RC=0
 if $TP_T_CRD; then
-  TP_T_ORCH=$($K get tridentorchestrators --no-headers -o custom-columns=NAME:.metadata.name,NAMESPACE:.spec.namespace,STATUS:.status.status 2>/dev/null); TP_T_ORCH_RC=$?
+  TP_T_ORCH=$($K get tridentorchestrators --no-headers -o custom-columns=NAME:.metadata.name,NAMESPACE:.spec.namespace,STATUS:.status.status 2>"$TP_T_ERR"); TP_T_ORCH_RC=$?
+  [ "$TP_T_ORCH_RC" -ne 0 ] && TP_T_ORCH_WHY=$(tp_t_why)
 fi
+# One sentence for "could not read", with the reason when kubectl gave one.
+tp_t_unread() { if [ -n "$2" ]; then echo "   $1 unknown: $3 could not be read ($2)."; else echo "   $1 unknown: $3 could not be read."; fi; }
 if [ -n "$TP_T_ORCH" ] || [ -n "$TP_T_CONTROLLER" ]; then
   echo "   TRIDENT IS INSTALLED"
   if [ -n "$TP_T_CONTROLLER" ]; then
     printf '%s\n' "$TP_T_CONTROLLER" | awk '{printf "   controller   %s in namespace %s   image %s\n", $2, $1, $3}'
+  elif [ "$TP_T_RC" -ne 0 ]; then
+    tp_t_unread "controller  " "$TP_T_DEPLOYS_WHY" "the Deployment list"
   else
     echo "   controller   none found. An orchestrator exists but no trident-controller Deployment does."
   fi
   if [ -n "$TP_T_ORCH" ]; then
     printf '%s\n' "$TP_T_ORCH" | awk '{printf "   orchestrator %s   installs into %s   status %s\n", $1, $2, $3}'
+  elif $TP_T_CRD_UNREAD; then
+    tp_t_unread "orchestrator" "$TP_T_ORCH_WHY" "the TridentOrchestrator CRD"
   elif $TP_T_CRD && [ "$TP_T_ORCH_RC" -ne 0 ]; then
-    echo "   orchestrator unknown: the TridentOrchestrator list could not be read."
+    tp_t_unread "orchestrator" "$TP_T_ORCH_WHY" "the TridentOrchestrator list"
   fi
-  TP_T_BE=$( { $K get tridentbackendconfigs -A --no-headers 2>/dev/null; $K get tridentbackends -A --no-headers 2>/dev/null; } | grep -c . )
+  TP_T_BE1=$($K get tridentbackendconfigs -A --no-headers 2>"$TP_T_ERR"); TP_T_BE1_RC=$?
+  TP_T_BE1_WHY=""; [ "$TP_T_BE1_RC" -ne 0 ] && TP_T_BE1_WHY=$(tp_t_why)
+  TP_T_BE2=$($K get tridentbackends -A --no-headers 2>"$TP_T_ERR"); TP_T_BE2_RC=$?
+  TP_T_BE2_WHY=""; [ "$TP_T_BE2_RC" -ne 0 ] && TP_T_BE2_WHY=$(tp_t_why)
+  TP_T_BE=$( { [ "$TP_T_BE1_RC" -eq 0 ] && printf '%s\n' "$TP_T_BE1"; [ "$TP_T_BE2_RC" -eq 0 ] && printf '%s\n' "$TP_T_BE2"; } | grep -c . )
   if [ "${TP_T_BE:-0}" -gt 0 ]; then
     echo "   backends     $TP_T_BE record(s) found (see the backends section below)"
+    { [ "$TP_T_BE1_RC" -ne 0 ] || [ "$TP_T_BE2_RC" -ne 0 ]; } && echo "                one of the two backend lists could not be read, so there may be more."
+  elif [ "$TP_T_BE1_RC" -ne 0 ] || [ "$TP_T_BE2_RC" -ne 0 ]; then
+    tp_t_unread "backends    " "${TP_T_BE1_WHY:-$TP_T_BE2_WHY}" "the backend list"
+    echo "                Whether a backend exists was NOT checked."
   else
     echo "   backends     no backend yet, so there is nowhere to provision a volume."
   fi
@@ -674,19 +732,23 @@ elif [ -n "$TP_T_OPERATOR" ] || $TP_T_CRD; then
   else
     echo "   operator     its CRD (tridentorchestrators.trident.netapp.io) is here but no trident-operator Deployment was found."
   fi
-  if [ "$TP_T_ORCH_RC" -ne 0 ]; then
-    echo "   orchestrator unknown: the TridentOrchestrator list could not be read."
+  if $TP_T_CRD_UNREAD; then
+    tp_t_unread "orchestrator" "$TP_T_ORCH_WHY" "the TridentOrchestrator CRD"
+  elif [ "$TP_T_ORCH_RC" -ne 0 ]; then
+    tp_t_unread "orchestrator" "$TP_T_ORCH_WHY" "the TridentOrchestrator list"
   else
     echo "   There is no TridentOrchestrator, so no Trident controller is running and no backend exists."
     echo "   The destination does not exist yet. Building it is our job."
   fi
-elif [ "$TP_T_RC" -ne 0 ]; then
-  echo "   unknown: the Deployments of this cluster could not be listed, so whether Trident"
-  echo "   or its operator is installed was NOT checked."
+elif [ "$TP_T_RC" -ne 0 ] || $TP_T_CRD_UNREAD; then
+  echo "   unknown: the Deployments or the TridentOrchestrator CRD of this cluster could not be"
+  echo "   read, so whether Trident or its operator is installed was NOT checked."
+  [ -n "$TP_T_DEPLOYS_WHY$TP_T_ORCH_WHY" ] && echo "   kubectl said: ${TP_T_DEPLOYS_WHY:-$TP_T_ORCH_WHY}"
 else
   echo "   NOT INSTALLED — no Trident operator, no orchestrator and no controller found in any"
   echo "   namespace. The destination does not exist yet. Building it is our job."
 fi
+[ "$TP_T_ERR" = /dev/null ] || rm -f "$TP_T_ERR"
 echo "   Qtree import is Tech Preview from 26.06. Below that an"
 echo "   ontap-nas-economy destination cannot be adopted."
 echo
@@ -934,7 +996,7 @@ for NS in $NAMESPACES; do
     # function section D uses — this line used to have its own weaker copy of
     # the question, and a namespace could be called operator-free here and
     # operator-owned there.
-    OPERATOR=$(tp_operator_owners "$NS" /tmp/tp-w.$$ | awk -F'\t' '$3 != "ours"')
+    OPERATOR=$(tp_operator_owners "$NS" /tmp/tp-w.$$ | awk -F'\t' '$3 != "ours"' | sort -u)
     [ -n "$OPERATOR" ] && {
       echo "     *** OPERATOR-OWNED: the stop goes through its custom resource ***"
       echo "$OPERATOR" | awk -F'\t' '{printf "       %s/%s   %s\n", $1, $2, $3}'
@@ -2683,6 +2745,7 @@ tp_inventory() {
   TP_COUNT_MAX_PVCS="${TP_COUNT_MAX_PVCS:-200}" \
   TP_DATA_ENGINES="$TP_DATA_ENGINES" TP_NOT_THE_ENGINE="$TP_NOT_THE_ENGINE" \
   TP_REGISTRY_CRDS="$TP_REGISTRY_CRDS" TP_REFUSES_ZERO="$TP_REFUSES_ZERO" \
+  TP_OUR_OWN_KIND="$TP_OUR_OWN_KIND" TP_OUR_OWN_GROUP="$TP_OUR_OWN_GROUP" \
   python3 - <<'TP_INV_PY'
 import collections
 import concurrent.futures
@@ -2710,6 +2773,7 @@ COUNT_MAX = int(os.environ.get("TP_COUNT_MAX_PVCS", "200") or 200)
 DATA_ENGINES = os.environ.get("TP_DATA_ENGINES", "")
 NOT_ENGINE = os.environ.get("TP_NOT_THE_ENGINE", "exporter|operator")
 REGISTRY_CRDS = os.environ.get("TP_REGISTRY_CRDS", "")
+OUR_OWN = (os.environ.get("TP_OUR_OWN_KIND", ""), os.environ.get("TP_OUR_OWN_GROUP", ""))
 REFUSES_ZERO = set((os.environ.get("TP_REFUSES_ZERO", "")).split("|"))
 IS_TTY = False
 
@@ -3543,6 +3607,15 @@ def L(name):
 
 
 # ── 2. who holds what: pods, workloads, owners ──────────────────────────────
+SUPPORTED = []   # (kind, resource, group)
+for pair in REGISTRY_CRDS.split(";"):
+    if "=" not in pair:
+        continue
+    kind, res = pair.split("=", 1)
+    grp = res.split(".", 1)[1] if "." in res else None
+    SUPPORTED.append((kind, res, grp))
+SUP_KINDS = {k for k, _, _ in SUPPORTED}
+
 OBJ = {}
 for kind, rname in (("Deployment", "deploy"), ("StatefulSet", "sts"), ("DaemonSet", "ds"),
                     ("ReplicaSet", "rs"), ("Job", "job"), ("CronJob", "cronjob")):
@@ -3562,8 +3635,34 @@ def owner_of(o):
     return refs[0] if refs else None
 
 
+CUSTOM_OBJ = {}   # (kind, group, namespace) -> {name: object}, or None when unreadable
+
+
+def custom_owner(ref, ns):
+    """The object a custom-resource ownerReference points to, or None.
+
+    An operator often puts an intermediate between the pod and the resource
+    the user wrote (a pod set, a replica group). One namespaced list per
+    (kind, group, namespace), read once. Read-only, through kc()."""
+    kind, grp = ref.get("kind"), group_of(ref.get("apiVersion"))
+    ck = (kind, grp, ns)
+    if ck not in CUSTOM_OBJ:
+        found = None
+        rc, out, err = kc(["get", "%s.%s" % (kind, grp), "-n", ns, "-o", "json"], READ_TIMEOUT)
+        if rc == 0:
+            try:
+                found = {meta(i).get("name"): i for i in parse_items(out)}
+            except ValueError:
+                found = None
+        CUSTOM_OBJ[ck] = found
+    return (CUSTOM_OBJ[ck] or {}).get(ref.get("name"))
+
+
 def chain_of(o):
-    """pod -> ReplicaSet -> Deployment -> custom resource, as far as it is readable."""
+    """pod -> ReplicaSet -> Deployment -> custom resource, as far as it is readable.
+
+    It climbs through custom resources too, until it reaches a kind of the
+    catalogue (SUP_KINDS) or something it cannot read."""
     out, seen, ns = [], set(), meta(o).get("namespace") or ""
     cur = o
     for _ in range(6):
@@ -3571,12 +3670,20 @@ def chain_of(o):
         if not ref:
             break
         k = (ref.get("kind"), ns, ref.get("name"))
-        out.append({"kind": ref.get("kind"), "name": ref.get("name"),
-                    "group": group_of(ref.get("apiVersion"))})
-        if k in seen or k not in OBJ:
+        grp = group_of(ref.get("apiVersion"))
+        out.append({"kind": ref.get("kind"), "name": ref.get("name"), "group": grp})
+        if k in seen:
             break
         seen.add(k)
-        cur = OBJ[k]
+        if k in OBJ:
+            cur = OBJ[k]
+        elif grp not in CORE_GROUPS and ref.get("kind") not in SUP_KINDS:
+            nxt = custom_owner(ref, ns)
+            if nxt is None:
+                break
+            cur = nxt
+        else:
+            break
     return out, cur
 
 
@@ -3750,14 +3857,8 @@ def smb_kind(driver, pv=None, sc=None):
 
 
 # ── 5. operators ─────────────────────────────────────────────────────────────
-SUPPORTED = []   # (kind, resource, group)
-for pair in REGISTRY_CRDS.split(";"):
-    if "=" not in pair:
-        continue
-    kind, res = pair.split("=", 1)
-    grp = res.split(".", 1)[1] if "." in res else None
-    SUPPORTED.append((kind, res, grp))
-SUP_KINDS = {k for k, _, _ in SUPPORTED}
+# (SUPPORTED and SUP_KINDS are built above, in section 2: the owner chain stops
+# at the first kind of the catalogue.)
 
 crds = []
 if R["crd"].ok:
@@ -3843,7 +3944,8 @@ for pvc in L("pvc"):
         for c in ch:
             if c["kind"] in WORKLOAD_KINDS and wl is None:
                 wl = "%s/%s" % (c["kind"], c["name"])
-            if c["group"] not in CORE_GROUPS and owner_cr is None:
+            if c["group"] not in CORE_GROUPS and (owner_cr is None or (
+                    owner_cr["kind"] not in SUP_KINDS and c["kind"] in SUP_KINDS)):
                 owner_cr = {"kind": c["kind"], "group": c["group"], "name": c["name"]}
             kinds.append(c["kind"])
         objs_for_git += [pi["last"], p]
@@ -3854,13 +3956,17 @@ for pvc in L("pvc"):
             wl = "StatefulSet/%s (claim of its volumeClaimTemplates; no pod mounts it now)" % meta(s_owner).get("name")
             ch2, last2 = chain_of(s_owner)
             for c in ch2:
-                if c["group"] not in CORE_GROUPS and owner_cr is None:
+                if c["group"] not in CORE_GROUPS and (owner_cr is None or (
+                        owner_cr["kind"] not in SUP_KINDS and c["kind"] in SUP_KINDS)):
                     owner_cr = {"kind": c["kind"], "group": c["group"], "name": c["name"]}
                 kinds.append(c["kind"])
             objs_for_git += [s_owner, last2]
     if wl is None and mounted_by:
         wl = mounted_by[0]["controller"]
-    if owner_cr and owner_cr["kind"] not in SUP_KINDS and owner_cr["kind"] != "VirtualMachineInstance":
+    # Ours is excluded by the same kind AND group the operator section uses
+    # (TP_OUR_OWN_KIND / TP_OUR_OWN_GROUP, defined once at the top of the script).
+    if owner_cr and owner_cr["kind"] not in SUP_KINDS and owner_cr["kind"] != "VirtualMachineInstance" \
+            and (owner_cr["kind"], owner_cr["group"]) != OUR_OWN:
         un = unsupported_owners.setdefault("%s.%s" % (owner_cr["kind"], owner_cr["group"]), {"claims": 0, "namespaces": set()})
         un["claims"] += 1
         un["namespaces"].add(ns)
