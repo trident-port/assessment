@@ -60,6 +60,9 @@
 #                                      read-only find in the pod that mounts it)
 #   ./tp-pre.sh --probe-pull           also run a pod to test the image pull (CREATES a
 #                                      pod, then deletes it) - off by default
+#   ./tp-pre.sh --probe-pull --probe-image <registry>/<image>:<tag>
+#                                      the same test with an image your registry serves
+#                                      (or set TP_PROBE_IMAGE), default alpine:3.19
 #   ./tp-pre.sh --bench --dest-sc <class>
 #                                      also MEASURE copy speed and estimate the time of
 #                                      the migration. CREATES a namespace tp-bench and
@@ -101,6 +104,7 @@ TP_PRINT_INTERNAL=true
 TP_NODE_DEBUG=false
 TP_COUNT_FILES=false
 TP_PROBE_PULL=false
+TP_PROBE_IMAGE="${TP_PROBE_IMAGE:-alpine:3.19}"
 TP_BENCH=false
 TP_BENCH_DEST=""
 TP_BENCH_SRC=""
@@ -121,6 +125,7 @@ while [ $# -gt 0 ]; do
     --node-debug) TP_NODE_DEBUG=true; shift ;;
     --count-files) TP_COUNT_FILES=true; shift ;;
     --probe-pull) TP_PROBE_PULL=true; shift ;;
+    --probe-image) TP_PROBE_IMAGE="${2:-}"; shift 2 ;;
     --bench) TP_BENCH=true; shift ;;
     --dest-sc) TP_BENCH_DEST="${2:-}"; shift 2 ;;
     --source-sc) TP_BENCH_SRC="${2:-}"; shift 2 ;;
@@ -359,13 +364,25 @@ TP_OUR_OWN_GROUP="trident-port.netapp.io"
 TP_JQ_OWNERS='def tp_operator_refs: (.metadata.ownerReferences // [])[]
   | select(.kind != "ReplicaSet" and .kind != "Deployment"
            and .kind != "StatefulSet" and .kind != "DaemonSet"
-           and .kind != "Job" and .kind != "CronJob" and .kind != "Node");'
+           and .kind != "Job" and .kind != "CronJob" and .kind != "Node");
+  def tp_holds_claim: ((.spec.volumeClaimTemplates // []) | length > 0)
+    or ([(.spec.template.spec.volumes // [])[] | select(.persistentVolumeClaim)] | length > 0);'
 
-# tp_operator_owners <namespace> [workloads-json-file]
+# tp_operator_owners <namespace> [workloads-json-file] [unclaimed]
 # Prints one line per operator found:  <kind>\t<name>\t<how>
 # `how` is `owns it`, `manages it by label; no ownerReference`, or `ours`.
+#
+# ONLY OPERATORS THAT REACH A CLAIM. An owner is reported when the workload it
+# owns holds a PersistentVolumeClaim (a volume of the pod template, or a
+# volumeClaimTemplate). Every owned workload in a namespace that has claims
+# used to be reported, so an operator's own Deployment put its owner (a
+# ClusterVersion, a ClusterServiceVersion) in the list as if it were an
+# application to stop, and then under "WHERE THE COPY WOULD BE HOT". Stopping
+# such an owner stops nothing that holds data. The third argument `unclaimed`
+# asks the opposite question, so the report can say what it left out.
 tp_operator_owners() {
-  _ns=$1; _wfile=${2:-}
+  _ns=$1; _wfile=${2:-}; _want=true
+  [ "${3:-}" = "unclaimed" ] && _want=false
   $HAVE_JQ || return 0
   if [ -n "$_wfile" ] && [ -s "$_wfile" ]; then
     _wjson=$(cat "$_wfile")
@@ -375,14 +392,14 @@ tp_operator_owners() {
   [ -n "$_wjson" ] || return 0
 
   printf '%s' "$_wjson" | jq -r "$TP_JQ_OWNERS"'
-    .items[]? | tp_operator_refs
+    .items[]? | select(tp_holds_claim == $want) | tp_operator_refs
     | . as $r
     | "\($r.kind)\t\($r.name)\t"
       + (if $r.kind == $ourkind
             and (($r.apiVersion // "") | split("/") | .[0]) == $ourgroup
          then "ours" else "owns it" end)' \
     --arg ourkind "$TP_OUR_OWN_KIND" --arg ourgroup "$TP_OUR_OWN_GROUP" \
-    2>/dev/null | sort -u
+    --argjson want "$_want" 2>/dev/null | sort -u
 
   while IFS='|' read -r _kind _res _label _req; do
     [ -n "$_kind" ] || continue
@@ -390,12 +407,14 @@ tp_operator_owners() {
     # answered by the pass above, and answering it twice by a weaker method
     # is how the two answers come to disagree.
     _cands=$(printf '%s' "$_wjson" | jq -r "$TP_JQ_OWNERS"'
-      .items[]? | select([tp_operator_refs] | length == 0)
+      .items[]? | select(tp_holds_claim == $want)
+      | select([tp_operator_refs] | length == 0)
       | (.metadata.labels // {}) as $l
       | select([$req | split(",")[] | select(length > 0) | split("=")
                 | $l[.[0]] == .[1]] | all)
       | ($l[$namelabel] // "") | select(. != "")' \
-      --arg namelabel "$_label" --arg req "$_req" 2>/dev/null | sort -u)
+      --arg namelabel "$_label" --arg req "$_req" --argjson want "$_want" \
+      2>/dev/null | sort -u)
     for _name in $_cands; do
       # The confirmation. Without it a copied label stops an application
       # through a custom resource that is not there.
@@ -608,11 +627,68 @@ echo "   (initContainer with restartPolicy: Always), absent below it."
 
 echo
 echo "-- Trident --"
-$K get deploy -n trident -o jsonpath='{range .items[*]}   {.metadata.name}{"\t"}{.spec.template.spec.containers[0].image}{"\n"}{end}' 2>/dev/null \
-  || echo "   NOT INSTALLED — the destination does not exist yet; building it is our job."
+# THREE DIFFERENT ANSWERS, and this section used to be able to give one. It
+# asked for Deployments in the namespace `trident` and nowhere else, so an
+# operator installed from OperatorHub into `openshift-operators` printed
+# nothing at all, and a list that could not be read was reported as "NOT
+# INSTALLED". The operator and the orchestrator it runs are two different
+# things: the operator alone provisions nothing, and the destination exists
+# only once a TridentOrchestrator has made the controller and a backend has
+# been added to it. So:
+#   nothing found                        -> NOT INSTALLED
+#   operator, no orchestrator            -> OPERATOR INSTALLED, NOTHING DEPLOYED FROM IT
+#   an orchestrator or a controller      -> TRIDENT IS INSTALLED
+#   a list that could not be read        -> unknown, never "not installed"
+# Every read is a plain `get`, in every namespace.
+TP_T_DEPLOYS=$($K get deploy -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.template.spec.containers[0].image 2>/dev/null); TP_T_RC=$?
+TP_T_OPERATOR=$(printf '%s\n' "$TP_T_DEPLOYS" | awk 'index(tolower($2), "trident-operator") || index(tolower($3), "trident-operator") {print}')
+TP_T_CONTROLLER=$(printf '%s\n' "$TP_T_DEPLOYS" | awk '$2 == "trident-controller" {print}')
+TP_T_CRD=false
+$K get crd tridentorchestrators.trident.netapp.io >/dev/null 2>&1 && TP_T_CRD=true
+TP_T_ORCH=""; TP_T_ORCH_RC=0
+if $TP_T_CRD; then
+  TP_T_ORCH=$($K get tridentorchestrators --no-headers -o custom-columns=NAME:.metadata.name,NAMESPACE:.spec.namespace,STATUS:.status.status 2>/dev/null); TP_T_ORCH_RC=$?
+fi
+if [ -n "$TP_T_ORCH" ] || [ -n "$TP_T_CONTROLLER" ]; then
+  echo "   TRIDENT IS INSTALLED"
+  if [ -n "$TP_T_CONTROLLER" ]; then
+    printf '%s\n' "$TP_T_CONTROLLER" | awk '{printf "   controller   %s in namespace %s   image %s\n", $2, $1, $3}'
+  else
+    echo "   controller   none found. An orchestrator exists but no trident-controller Deployment does."
+  fi
+  if [ -n "$TP_T_ORCH" ]; then
+    printf '%s\n' "$TP_T_ORCH" | awk '{printf "   orchestrator %s   installs into %s   status %s\n", $1, $2, $3}'
+  elif $TP_T_CRD && [ "$TP_T_ORCH_RC" -ne 0 ]; then
+    echo "   orchestrator unknown: the TridentOrchestrator list could not be read."
+  fi
+  TP_T_BE=$( { $K get tridentbackendconfigs -A --no-headers 2>/dev/null; $K get tridentbackends -A --no-headers 2>/dev/null; } | grep -c . )
+  if [ "${TP_T_BE:-0}" -gt 0 ]; then
+    echo "   backends     $TP_T_BE record(s) found (see the backends section below)"
+  else
+    echo "   backends     no backend yet, so there is nowhere to provision a volume."
+  fi
+elif [ -n "$TP_T_OPERATOR" ] || $TP_T_CRD; then
+  echo "   OPERATOR INSTALLED, NOTHING DEPLOYED FROM IT"
+  if [ -n "$TP_T_OPERATOR" ]; then
+    printf '%s\n' "$TP_T_OPERATOR" | awk '{printf "   operator     %s in namespace %s   image %s\n", $2, $1, $3}'
+  else
+    echo "   operator     its CRD (tridentorchestrators.trident.netapp.io) is here but no trident-operator Deployment was found."
+  fi
+  if [ "$TP_T_ORCH_RC" -ne 0 ]; then
+    echo "   orchestrator unknown: the TridentOrchestrator list could not be read."
+  else
+    echo "   There is no TridentOrchestrator, so no Trident controller is running and no backend exists."
+    echo "   The destination does not exist yet. Building it is our job."
+  fi
+elif [ "$TP_T_RC" -ne 0 ]; then
+  echo "   unknown: the Deployments of this cluster could not be listed, so whether Trident"
+  echo "   or its operator is installed was NOT checked."
+else
+  echo "   NOT INSTALLED — no Trident operator, no orchestrator and no controller found in any"
+  echo "   namespace. The destination does not exist yet. Building it is our job."
+fi
 echo "   Qtree import is Tech Preview from 26.06. Below that an"
 echo "   ontap-nas-economy destination cannot be adopted."
-
 echo
 echo "-- Nodes --"
 $K get nodes -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory --no-headers 2>/dev/null | sed 's/^/   /'
@@ -623,16 +699,36 @@ echo "   ESTIMATE, not a measurement. Say so rather than quoting the number."
 
 echo
 echo "-- Can the nodes run the copy image? --"
+# An OPTIONAL test, and it was read as an error and as a requirement for
+# alpine:3.19. The image the nodes must be able to pull is Trident Port's own,
+# from its registry: the copy pods run the product's own image (alpine is only
+# the last resort when no product image is named), and Trident needs none of
+# this. What the test pulls is a small public image, only to see whether the
+# nodes can reach a registry at all. On a cluster with no route to the public
+# internet it is expected to fail, and that means nothing.
+[ -n "$TP_PROBE_IMAGE" ] || TP_PROBE_IMAGE=alpine:3.19
 if $TP_PROBE_PULL; then
-  $K run tp-pull-probe --image=alpine:3.19 --restart=Never --command -- sh -c 'echo ok' >/dev/null 2>&1
+  echo "   Test image: $TP_PROBE_IMAGE (a small stand-in used only to test the way out to a registry)"
+  $K run tp-pull-probe --image="$TP_PROBE_IMAGE" --restart=Never --command -- sh -c 'echo ok' >/dev/null 2>&1
   $K wait --for=jsonpath='{.status.phase}'=Succeeded pod/tp-pull-probe --timeout=90s >/dev/null 2>&1 \
-    && echo "   OK — alpine:3.19 runs on this cluster" \
-    || { echo "   PROBE DID NOT SUCCEED:"; $K describe pod tp-pull-probe 2>/dev/null | sed -n '/Events:/,$p' | tail -8 | sed 's/^/     /'; }
+    && echo "   OK — the nodes pulled and ran $TP_PROBE_IMAGE, so they can reach a registry" \
+    || { echo "   THE TEST POD DID NOT RUN. Only this optional test failed: the nodes could not"
+         echo "   pull or run $TP_PROBE_IMAGE. That says nothing about Trident or about the"
+         echo "   product, and on a cluster with no route to the public internet it is expected."
+         echo "   The image that matters is Trident Port's own, from its registry. To test with"
+         echo "   an image your registry serves, run again with --probe-image <registry>/<image>:<tag>"
+         echo "   Events from the test pod:"
+         $K describe pod tp-pull-probe 2>/dev/null | sed -n '/Events:/,$p' | tail -8 | sed 's/^/     /'; }
   $K delete pod tp-pull-probe --ignore-not-found >/dev/null 2>&1
 else
-  echo "   NOT RUN - this test creates a pod, and this script otherwise writes nothing."
-  echo "   Re-run with --probe-pull to test it, or ask the cluster team whether the"
-  echo "   nodes can pull alpine:3.19 (or the mirrored equivalent) from their registry."
+  echo "   NOT RUN. This is an optional test and not a failure. It starts one pod, and this"
+  echo "   script otherwise writes nothing, so it only runs when asked for."
+  echo "   The image the nodes must be able to pull is Trident Port's own, from its registry."
+  echo "   This test does not check that one. It pulls a small public image (alpine:3.19 by"
+  echo "   default) only to see whether the nodes can reach a registry at all."
+  echo "   That image is not a requirement of the product, and Trident does not need it."
+  echo "   To run it anyway: --probe-pull, and --probe-image <registry>/<image>:<tag> to use"
+  echo "   an image your own registry serves."
 fi
 echo "   Wait for Succeeded, not Ready: the container prints and exits, so a"
 echo "   Ready condition is never satisfied and the wait times out for a"
@@ -1027,7 +1123,12 @@ echo "-- Virtual machine disks --"
 # with --cascade=orphan, recreate the claim — in that order. None of that
 # looks like scaling a Deployment, so a VM found late is a wave replanned.
 if $K get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
-  VMS=$($K get vm -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RUNNING:.spec.running 2>/dev/null)
+  # The state is status.printableStatus (Running, Stopped, Paused, Migrating...)
+  # and not spec.running: a VM driven by spec.runStrategy, which is what
+  # OpenShift Virtualization writes, has no spec.running and printed <none>.
+  # A VM whose status is absent says "unknown" — an empty field is not a state.
+  VMS=$($K get vm -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.printableStatus 2>/dev/null \
+        | sed -E 's/<none>[[:space:]]*$/unknown/')
   if [ -n "$VMS" ]; then
     echo "$VMS" | sed 's/^/   /'
     echo "   Each of these is its own cutover procedure. Confirm whether"
@@ -1073,12 +1174,17 @@ echo "-- OPERATORS: what owns the workloads, and do we have a stop for it --"
 # ownerReference, and where there is none the label conventions the product's
 # own registry records, with the custom resource confirmed to exist.
 if $HAVE_JQ; then
-  FOUND=""
+  FOUND=""; UNCLAIMED_ALL=""
   for NS in $NAMESPACES; do
     [ -z "$NS" ] && continue
     OWNERS=$(tp_operator_owners "$NS" | awk -v ns="$NS" -F'\t' \
              '{printf "%s\t%s\t%s\t%s\n", ns, $1, $2, $3}')
     [ -n "$OWNERS" ] && FOUND="$FOUND$OWNERS"$'\n'
+    # And the operators that own only workloads with no claim, so the report
+    # can say what it left out instead of leaving the reader to wonder.
+    NOCLAIM=$(tp_operator_owners "$NS" "" unclaimed | awk -v ns="$NS" -F'\t' \
+              '$3 != "ours" {printf "%s\t%s\t%s\n", ns, $1, $2}')
+    [ -n "$NOCLAIM" ] && UNCLAIMED_ALL="$UNCLAIMED_ALL$NOCLAIM"$'\n'
   done
   OURS=$(echo "$FOUND" | awk -F'\t' '$4 == "ours"' | sort -u)
   THEIRS=$(echo "$FOUND" | grep -v '^$' | awk -F'\t' '$4 != "ours"' | sort -u)
@@ -1115,6 +1221,16 @@ if $HAVE_JQ; then
       [ -n "$KIND" ] || continue
       if echo "$KIND" | grep -qE "^($TP_KNOWN_OPERATORS)$"; then
         printf '   %-14s %s/%s   KNOWN — we have a tested stop for this kind\n' "$NS" "$KIND" "$NAME"
+      elif echo "$KIND" | grep -qE "^($TP_REGISTRY_OPERATORS)$"; then
+        # THREE ANSWERS, and this used to print two. The product's registry
+        # knows far more kinds than the lab has installed and run, and a kind
+        # the registry knows was called "not in our catalogue" on the line
+        # above its own stop recipe.
+        printf '   %-14s %s/%s   IN OUR REGISTRY — not one we have run in our own lab\n' "$NS" "$KIND" "$NAME"
+        echo "                  The product knows this kind and how to stop it, but that"
+        echo "                  stop has not been confirmed on a cluster of ours. Validate"
+        echo "                  it against their cluster before the window:"
+        echo "                  tp compat validate-operator-scaling.sh"
       else
         printf '   %-14s %s/%s   *** NOT IN OUR CATALOGUE ***\n' "$NS" "$KIND" "$NAME"
         echo "                  Validate the stop against their cluster before"
@@ -1173,6 +1289,14 @@ if $HAVE_JQ; then
     echo "   Scaling what an operator owns achieves nothing — it reconciles the"
     echo "   replicas back in seconds. The stop goes through the custom resource"
     echo "   named above."
+  fi
+  NOT_LISTED=$(printf '%s' "$UNCLAIMED_ALL" | grep -v '^$' | sort -u \
+               | TP_THEIRS="$THEIRS" awk -F'\t' 'BEGIN {n = split(ENVIRON["TP_THEIRS"], a, "\n"); for (i = 1; i <= n; i++) {split(a[i], f, "\t"); seen[f[1] "\t" f[2] "\t" f[3]] = 1}} !(($1 "\t" $2 "\t" $3) in seen)')
+  if [ -n "$NOT_LISTED" ]; then
+    echo
+    echo "   These operators own workloads that hold no claim, so they are not"
+    echo "   listed above. Stopping them frees no data:"
+    echo "$NOT_LISTED" | awk -F'\t' '{printf "     %-14s %s/%s\n", $1, $2, $3}'
   fi
   [ -n "$OURS" ] && {
     echo
@@ -1299,7 +1423,21 @@ sec "F. THE ARRAY"
 # live on the filer are deferred. `tridentctl` is used when it is there and
 # the CRs when it is not: both are reads of the same records.
 echo "-- What Trident records, without asking the array --"
-$K -n "${TRIDENT_NS:-trident}" get tridentbackend -o json 2>/dev/null | python3 -c '
+# TWO DIFFERENT REASONS A RECORD CAN BE MISSING, and one message used to cover
+# both. These reads pipe kubectl into python3, and under `pipefail` a kubectl
+# that failed (no Trident resource type, no permission) made the pipeline fail
+# even though python3 was there and had just printed its own line, so the
+# report said "no python3 here". Now python3 is asked for first, and a failed
+# read is a failed read.
+TP_HAVE_PY=true
+command -v python3 >/dev/null 2>&1 || TP_HAVE_PY=false
+if ! $TP_HAVE_PY; then
+  echo "   NOT CHECKED — python3 is not installed here, so Trident's backend and volume records"
+  echo "   were not read. What is missing below is unknown and not zero. To read them, run this"
+  echo "   from a machine that has python3, with ONTAP_MGMT_LIF and ONTAP_USER set for the array."
+else
+TP_REC=$($K -n "${TRIDENT_NS:-trident}" get tridentbackend -o json 2>/dev/null)
+printf '%s' "$TP_REC" | python3 -c '
 import sys, json
 try:
     items = json.load(sys.stdin).get("items", [])
@@ -1318,12 +1456,17 @@ for b in items:
         if val:
             bits.append("{}{}".format(label, val))
     print("   {:22s} {}".format(b.get("backendName", "?"), "  ".join(bits)))
-' 2>/dev/null || echo "   (no python3 here — skipped)"
+' 2>/dev/null || echo "   unknown: python3 could not read the TridentBackend records."
+fi
 
 echo "-- Provisioned per pool, from Trident's own volume records --"
 echo "   (free space is NOT here: Trident stores what it created, not what"
 echo "    the aggregate has left. That one number still needs the array.)"
-$K -n "${TRIDENT_NS:-trident}" get tridentvolume -o json 2>/dev/null | python3 -c '
+if ! $TP_HAVE_PY; then
+  echo "   NOT CHECKED — see the python3 line above."
+else
+TP_REC=$($K -n "${TRIDENT_NS:-trident}" get tridentvolume -o json 2>/dev/null)
+printf '%s' "$TP_REC" | python3 -c '
 import sys, json
 try:
     items = json.load(sys.stdin).get("items", [])
@@ -1398,7 +1541,8 @@ if unknown:
         print("     {}".format(name))
     if len(unknown) > 8:
         print("     ... and {} more".format(len(unknown) - 8))
-' 2>/dev/null || echo "   (no python3 here — skipped)"
+' 2>/dev/null || echo "   unknown: python3 could not read the TridentVolume records."
+fi
 echo
 
 ONTAP_BASE="${ONTAP_API_BASE:-}"
