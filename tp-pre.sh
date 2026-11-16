@@ -774,7 +774,7 @@ if $TP_PROBE_PULL; then
   $K run tp-pull-probe --image="$TP_PROBE_IMAGE" --restart=Never --command -- sh -c 'echo ok' >/dev/null 2>&1
   $K wait --for=jsonpath='{.status.phase}'=Succeeded pod/tp-pull-probe --timeout=90s >/dev/null 2>&1 \
     && echo "   OK — the nodes pulled and ran $TP_PROBE_IMAGE, so they can reach a registry" \
-    || { echo "   THE TEST POD DID NOT RUN. Only this optional test failed: the nodes could not"
+    || { echo "   WARNING, not an error: this check is optional and it did not pass. The nodes could not"
          echo "   pull or run $TP_PROBE_IMAGE. That says nothing about Trident or about the"
          echo "   product, and on a cluster with no route to the public internet it is expected."
          echo "   The image that matters is Trident Port's own, from its registry. To test with"
