@@ -760,6 +760,86 @@ echo "   If that failed there is no metrics-server: concurrency becomes an"
 echo "   ESTIMATE, not a measurement. Say so rather than quoting the number."
 
 echo
+echo "-- Node memory and the XCP copy engine (read-only) --"
+# XCP is started on a node only when the node reports this much memory
+# available. The product's own default is 4096 and the chart value is
+# xcp.minFreeMiB, so the same number can be given here when it was lowered.
+TP_XCP_MIN_MIB=2560
+case "${TP_XCP_MIN_FREE_MIB:-}" in ''|*[!0-9]*|0) ;; *) TP_XCP_MIN_MIB=$TP_XCP_MIN_FREE_MIB ;; esac
+TP_XCP_COPIER_MIB=300      # one XCP copy or sync process, measured at 200 to 300
+TP_XCP_VERIFY_MIB=722      # one xcp verify, measured
+TP_XCP_FLOOR_MIB=2048      # XCP itself refuses to start below this
+if ! $HAVE_JQ; then
+  echo "   skipped: jq is missing here, and the node memory cannot be summed without it."
+else
+  TP_NM_DIR=$(mktemp -d 2>/dev/null || echo "")
+  TP_NM_NODES_OK=0; TP_NM_PODS_OK=0; TP_NM_METRICS_OK=0
+  if [ -n "$TP_NM_DIR" ]; then
+    $K get nodes -o json >"$TP_NM_DIR/nodes" 2>/dev/null && TP_NM_NODES_OK=1
+    $K get pods -A -o json >"$TP_NM_DIR/pods" 2>/dev/null && TP_NM_PODS_OK=1
+    $K get --raw /apis/metrics.k8s.io/v1beta1/nodes >"$TP_NM_DIR/metrics" 2>/dev/null \
+      && jq -e '(.items // []) | length > 0' "$TP_NM_DIR/metrics" >/dev/null 2>&1 && TP_NM_METRICS_OK=1
+    [ "$TP_NM_PODS_OK" = 1 ] || echo '{"items":[]}' >"$TP_NM_DIR/pods"
+    [ "$TP_NM_METRICS_OK" = 1 ] || echo '{"items":[]}' >"$TP_NM_DIR/metrics"
+  fi
+  if [ "$TP_NM_NODES_OK" != 1 ]; then
+    echo "   unknown: the nodes could not be read."
+  else
+    echo "   XCP starts with ${TP_XCP_MIN_MIB} MiB free on the node. One copier takes about ${TP_XCP_COPIER_MIB} MiB and a verify about ${TP_XCP_VERIFY_MIB} MiB."
+    jq -r --slurpfile pods "$TP_NM_DIR/pods" --slurpfile met "$TP_NM_DIR/metrics" \
+      --argjson t "$TP_XCP_MIN_MIB" --argjson c "$TP_XCP_COPIER_MIB" \
+      --argjson podsok "$TP_NM_PODS_OK" '
+      def q: if . == null then null else
+          ((tostring | try capture("^(?<n>[0-9.]+([eE][+-]?[0-9]+)?)(?<u>[A-Za-z]*)$") catch null) as $m
+           | if $m == null then null else
+               ({"":1,"m":0.001,"k":1e3,"M":1e6,"G":1e9,"T":1e12,"P":1e15,"E":1e18,
+                 "Ki":1024,"Mi":1048576,"Gi":1073741824,"Ti":1099511627776,
+                 "Pi":1125899906842624,"Ei":1152921504606846976}[$m.u]) as $f
+               | if $f == null then null else ($m.n | tonumber) * $f end
+             end) end;
+      def mib: if . == null then null else ((. / 1048576) | floor) end;
+      def fit($free): if $free == null then "unknown"
+                      elif $free < $t then "0"
+                      else ((($free - $t) / $c) | floor + 1 | tostring) end;
+      def pod_req: ((.spec.containers // []) | map(.resources.requests.memory | q // 0) | add // 0) as $sum
+                   | ((.spec.initContainers // []) | map(.resources.requests.memory | q // 0) | max // 0) as $init
+                   | ([$sum, $init] | max);
+      ($pods[0].items // []) as $pl
+      | (reduce ($pl[] | select(.spec.nodeName != null and .spec.nodeName != ""
+                                and (.status.phase != "Succeeded") and (.status.phase != "Failed"))) as $p
+           ({}; .[$p.spec.nodeName] += ($p | pod_req))) as $req
+      | (reduce (($met[0].items // [])[]) as $m ({}; .[$m.metadata.name] = ($m.usage.memory | q))) as $use
+      | .items[]
+      | .metadata.name as $n
+      | (.status.allocatable.memory | q | mib) as $alloc
+      | (if $podsok == 1 then (($req[$n] // 0) | mib) else null end) as $r
+      | (if $alloc != null and $r != null then $alloc - $r else null end) as $fr
+      | (if $alloc != null and $use[$n] != null then $alloc - ($use[$n] | mib) else null end) as $fm
+      | [ $n,
+          (if $alloc == null then "unknown" else "\($alloc) MiB" end),
+          (if $r == null then "unknown" else "\($r) MiB" end),
+          (if $fr == null then "unknown" else "\($fr) MiB" end),
+          (if $fm == null then "not available" else "\($fm) MiB" end),
+          fit($fr),
+          (if $fm == null then "not available" else fit($fm) end) ]
+      | @tsv' "$TP_NM_DIR/nodes" 2>/dev/null \
+      | awk -F'\t' '{ printf "   %-22s allocatable %s, requested %s, free by requests %s, free now %s | XCP copiers: %s by requests, %s by free memory\n", $1, $2, $3, $4, $5, $6, $7 }'
+    [ "$TP_NM_PODS_OK" = 1 ] || echo "   Pod requests unknown: the pods could not be read, so no node count by requests is given."
+    if [ "$TP_NM_METRICS_OK" != 1 ]; then
+      echo "   Free now: not available. There is no metrics server (or it was not readable) here,"
+      echo "   so the count by free memory is not given and nothing is estimated in its place."
+    fi
+    echo "   How it is counted: free is the allocatable memory minus the memory the pods on the node"
+    echo "   request (what the scheduler sees) or minus the measured use. Copiers = (free - ${TP_XCP_MIN_MIB}) / ${TP_XCP_COPIER_MIB} + 1,"
+    echo "   because the guard asks for ${TP_XCP_MIN_MIB} MiB free as each copier starts and each running one"
+    echo "   takes about ${TP_XCP_COPIER_MIB} MiB. XCP refuses below ${TP_XCP_FLOOR_MIB} MiB whatever the threshold. Each claim has its own"
+    echo "   copier, so in a mass migration they add up on the node that holds them. If the threshold was"
+    echo "   lowered in the chart (xcp.minFreeMiB), run this again with TP_XCP_MIN_FREE_MIB set to it."
+  fi
+  [ -n "$TP_NM_DIR" ] && rm -rf "$TP_NM_DIR"
+fi
+
+echo
 echo "-- Can the nodes run the copy image? --"
 # An OPTIONAL test, and it was read as an error and as a requirement for
 # alpine:3.19. The image the nodes must be able to pull is Trident Port's own,
@@ -774,7 +854,7 @@ if $TP_PROBE_PULL; then
   $K run tp-pull-probe --image="$TP_PROBE_IMAGE" --restart=Never --command -- sh -c 'echo ok' >/dev/null 2>&1
   $K wait --for=jsonpath='{.status.phase}'=Succeeded pod/tp-pull-probe --timeout=90s >/dev/null 2>&1 \
     && echo "   OK — the nodes pulled and ran $TP_PROBE_IMAGE, so they can reach a registry" \
-    || { echo "   WARNING, not an error: this check is optional and it did not pass. The nodes could not"
+    || { echo "   THE TEST POD DID NOT RUN. Only this optional test failed: the nodes could not"
          echo "   pull or run $TP_PROBE_IMAGE. That says nothing about Trident or about the"
          echo "   product, and on a cluster with no route to the public internet it is expected."
          echo "   The image that matters is Trident Port's own, from its registry. To test with"
@@ -908,6 +988,525 @@ else
   echo "   no VolumeGroupSnapshotClass — a namespace's claims cut over one"
   echo "   at a time, not at one instant"
 fi
+
+echo
+echo "-- Ceph / ODF storage topology (read-only) --"
+# Whether a Ceph or ODF source is one cluster per site, replicated, or
+# stretched decides what the NetApp side has to answer for. Every read is a
+# plain get. Not installed, empty and refused are three different answers: a
+# refused read is "unknown, needs read on X" and is never taken as absent.
+# The reading logic is the product's own, embedded below verbatim (a
+# test keeps the two identical) because this script runs where the product is
+# not installed. Nothing here has been measured against a real stretch cluster.
+TP_CEPH_DIR=$(mktemp -d 2>/dev/null)
+if [ -z "$TP_CEPH_DIR" ] || ! command -v python3 >/dev/null 2>&1; then
+  echo "   unknown: python3 or a scratch directory is missing here, so the Ceph topology was NOT read."
+else
+  for TP_CEPH_RES in cephclusters.ceph.rook.io storageclusters.ocs.openshift.io \
+      cephblockpools.ceph.rook.io cephfilesystems.ceph.rook.io \
+      cephrbdmirrors.ceph.rook.io cephfilesystemmirrors.ceph.rook.io \
+      volumereplications.replication.storage.openshift.io \
+      volumereplicationclasses.replication.storage.openshift.io \
+      drpolicies.ramendr.openshift.io drplacementcontrols.ramendr.openshift.io \
+      storageclasses.storage.k8s.io nodes persistentvolumeclaims; do
+    if $K get "$TP_CEPH_RES" -A -o json >"$TP_CEPH_DIR/$TP_CEPH_RES.json" 2>"$TP_CEPH_DIR/err"; then
+      echo ok >"$TP_CEPH_DIR/$TP_CEPH_RES.state"
+    elif grep -qi "doesn't have a resource type\|could not find the requested resource\|notfound\|not found" "$TP_CEPH_DIR/err"; then
+      echo absent >"$TP_CEPH_DIR/$TP_CEPH_RES.state"
+    else
+      echo "unknown $(tail -n 1 "$TP_CEPH_DIR/err" | cut -c1-160)" >"$TP_CEPH_DIR/$TP_CEPH_RES.state"
+    fi
+  done
+  python3 - "$TP_CEPH_DIR" <<'TP_CEPH_PY'
+"""The storage topology of a Ceph or ODF source, read and never changed.
+
+WHY THIS EXISTS. A customer who runs Ceph (or OpenShift Data Foundation) has
+usually been sold, or has bought, a topology: one Ceph stretched over two
+sites, two clusters that replicate to each other, or two clusters that know
+nothing about each other. What the NetApp side has to promise depends on
+which one it is, and the pre-assessment used to say nothing. This reads it
+from the cluster and states it in one line.
+
+HOW IT STAYS HONEST. Every read arrives as one of three states and they are
+never merged:
+
+    ok       the list was read (it may be empty)
+    absent   the CRD or resource type is not installed on this cluster
+    unknown  the read failed, usually Forbidden, and nothing can be said
+
+Only ``absent`` is an absence. A forbidden read is reported as
+"unknown, needs read on X" and it blocks the line "independent Ceph per
+cluster, no replication", because that sentence is a claim about everything
+that was NOT found.
+
+THE FILE IS SELF-CONTAINED ON PURPOSE (standard library only). The
+pre-engagement script runs on a machine that has no copy of the product, so
+this exact text is embedded in ``pre-engagement/tp-pre.sh`` and a test
+compares the two byte for byte. Edit it here, then re-embed.
+
+Nothing in this module has been measured against a real Ceph stretch cluster.
+It reads the documented fields of the Rook, ODF, csi-addons and Ramen APIs.
+"""
+
+import json
+import os
+import re
+import sys
+
+OK, ABSENT, UNKNOWN = "ok", "absent", "unknown"
+
+# Resource -> what it tells. The order is the order of the report.
+CEPHCLUSTERS = "cephclusters.ceph.rook.io"
+STORAGECLUSTERS = "storageclusters.ocs.openshift.io"
+BLOCKPOOLS = "cephblockpools.ceph.rook.io"
+FILESYSTEMS = "cephfilesystems.ceph.rook.io"
+RBDMIRRORS = "cephrbdmirrors.ceph.rook.io"
+FSMIRRORS = "cephfilesystemmirrors.ceph.rook.io"
+VOLREPS = "volumereplications.replication.storage.openshift.io"
+VOLREPCLASSES = "volumereplicationclasses.replication.storage.openshift.io"
+DRPOLICIES = "drpolicies.ramendr.openshift.io"
+DRPCS = "drplacementcontrols.ramendr.openshift.io"
+STORAGECLASSES = "storageclasses.storage.k8s.io"
+NODES = "nodes"
+CLAIMS = "persistentvolumeclaims"
+
+#: Read with ``get <name> -A -o json``, in this order.
+RESOURCES = (CEPHCLUSTERS, STORAGECLUSTERS, BLOCKPOOLS, FILESYSTEMS,
+             RBDMIRRORS, FSMIRRORS, VOLREPS, VOLREPCLASSES, DRPOLICIES,
+             DRPCS, STORAGECLASSES, NODES, CLAIMS)
+
+LABELS = {
+    CEPHCLUSTERS: "Rook CephCluster",
+    STORAGECLUSTERS: "ODF StorageCluster",
+    BLOCKPOOLS: "CephBlockPool mirroring",
+    FILESYSTEMS: "CephFilesystem mirroring",
+    RBDMIRRORS: "CephRBDMirror",
+    FSMIRRORS: "CephFilesystemMirror",
+    VOLREPS: "VolumeReplication",
+    VOLREPCLASSES: "VolumeReplicationClass",
+    DRPOLICIES: "ODF DRPolicy",
+    DRPCS: "ODF DRPlacementControl",
+}
+
+#: The replication rows, each present, absent, not installed or unknown.
+REPLICATION = (BLOCKPOOLS, FILESYSTEMS, RBDMIRRORS, FSMIRRORS, VOLREPS,
+               VOLREPCLASSES, DRPOLICIES, DRPCS)
+
+SUMMARY_INDEPENDENT = "independent Ceph per cluster, no replication"
+SUMMARY_ASYNC = ("asynchronous replication "
+                 "(RBD mirroring / ODF Regional-DR)")
+SUMMARY_STRETCH = ("synchronous stretch cluster "
+                   "(ODF Metro-DR / Ceph stretch mode)")
+
+#: Said as information, never as a promise.
+IMPLICATIONS = {
+    "stretch": (
+        "A synchronous or stretched expectation maps on the NetApp side "
+        "to SnapMirror active sync. That is SAN today, and NAS only from "
+        "ONTAP 9.19.1 at SVM level. Trident's own replication is "
+        "asynchronous, so it does not meet this expectation by itself."),
+    "async": (
+        "An asynchronous replication expectation maps on the NetApp side "
+        "to SnapMirror asynchronous. Trident's own replication is "
+        "asynchronous too."),
+    "independent": (
+        "Nothing here is replicated between clusters, so any replication "
+        "the customer expects on the NetApp side is new scope to confirm. "
+        "SnapMirror asynchronous is the usual answer and SnapMirror active "
+        "sync is the one for synchronous needs. Trident's own replication "
+        "is asynchronous."),
+    "unknown": (
+        "Ask the customer how the Ceph clusters are meant to protect each "
+        "other, because the cluster could not say. Do not assume a "
+        "replication or a stretch expectation either way."),
+    "none": "",
+}
+
+_ZERO_INTERVALS = ("0", "0s", "0m", "0h")
+_UNITS = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40,
+          "Pi": 2 ** 50, "Ei": 2 ** 60, "k": 10 ** 3, "M": 10 ** 6,
+          "G": 10 ** 9, "T": 10 ** 12, "P": 10 ** 15, "E": 10 ** 18}
+
+
+def read(state, items=None, why=""):
+    """One read, in the shape the analysis wants."""
+    return {"state": state, "items": list(items or []), "why": why or ""}
+
+
+def _get(spec, *path):
+    for key in path:
+        if not isinstance(spec, dict):
+            return None
+        spec = spec.get(key)
+    return spec
+
+
+def _items(reads, key):
+    return (reads.get(key) or {}).get("items") or []
+
+
+def _state(reads, key):
+    got = reads.get(key)
+    return got.get("state", UNKNOWN) if got else UNKNOWN
+
+
+def _name(obj):
+    return (obj.get("metadata") or {}).get("name", "")
+
+
+def _namespace(obj):
+    return (obj.get("metadata") or {}).get("namespace", "")
+
+
+def quantity_bytes(text):
+    """Bytes in a Kubernetes quantity, 0 when it cannot be read."""
+    match = re.match(r"^\s*([0-9.]+)\s*([A-Za-z]*)\s*$", str(text or ""))
+    if not match:
+        return 0
+    number, unit = match.groups()
+    try:
+        return int(float(number) * (_UNITS.get(unit, 1) if unit != "m"
+                                    else 0.001))
+    except ValueError:
+        return 0
+
+
+def human(size):
+    for unit, power in (("TiB", 40), ("GiB", 30), ("MiB", 20)):
+        if size >= 2 ** power:
+            return "%.1f %s" % (size / 2 ** power, unit)
+    return "%d B" % size
+
+
+def _is_true(value):
+    return value is True or str(value).lower() == "true"
+
+
+def _cluster_facts(reads):
+    """What the CephCluster and StorageCluster objects say about the layout."""
+    facts = {"rookStretch": [], "odfArbiter": False, "flexibleScaling": False,
+             "failureDomain": "", "failureDomainKey": "", "clusters": 0}
+    for cluster in _items(reads, CEPHCLUSTERS):
+        facts["clusters"] += 1
+        stretch = _get(cluster, "spec", "mon", "stretchCluster")
+        zones = (stretch or {}).get("zones") or []
+        if zones:
+            facts["rookStretch"].append({
+                "cluster": _name(cluster),
+                "label": stretch.get("failureDomainLabel", ""),
+                "zones": [z.get("name", "") for z in zones],
+                "arbiter": [z.get("name", "") for z in zones
+                            if _is_true(z.get("arbiter"))],
+            })
+    for odf in _items(reads, STORAGECLUSTERS):
+        facts["clusters"] += 1
+        if _is_true(_get(odf, "spec", "arbiter", "enable")):
+            facts["odfArbiter"] = True
+            facts["odfArbiterLocation"] = (
+                _get(odf, "spec", "nodeTopologies", "arbiterLocation") or "")
+        if _is_true(_get(odf, "spec", "flexibleScaling")):
+            facts["flexibleScaling"] = True
+        facts["failureDomain"] = (facts["failureDomain"]
+                                  or _get(odf, "status", "failureDomain")
+                                  or "")
+        facts["failureDomainKey"] = (
+            facts["failureDomainKey"]
+            or _get(odf, "status", "failureDomainKey") or "")
+    return facts
+
+
+def _domains(reads, facts):
+    """Failure domains Ceph can use, counted from the node labels."""
+    key = (next((s["label"] for s in facts["rookStretch"] if s["label"]), "")
+           or facts["failureDomainKey"] or "topology.kubernetes.io/zone")
+    nodes = _items(reads, NODES)
+    storage = [n for n in nodes if "cluster.ocs.openshift.io/openshift-storage"
+               in ((n.get("metadata") or {}).get("labels") or {})]
+    chosen = storage or nodes
+    values = sorted({((n.get("metadata") or {}).get("labels") or {}).get(key)
+                     for n in chosen} - {None, ""})
+    return {"key": key, "values": values, "nodesLooked": len(chosen),
+            "storageNodesLabelled": bool(storage),
+            "read": _state(reads, NODES) == OK}
+
+
+def _backing(storage_class, reads):
+    """Which pool or filesystem backs a Ceph CSI class, and is it mirrored."""
+    provisioner = storage_class.get("provisioner", "")
+    params = storage_class.get("parameters") or {}
+    if ("." + provisioner).endswith(".rbd.csi.ceph.com"):
+        kind, name, source, key = ("block", params.get("pool", ""),
+                                   BLOCKPOOLS, BLOCKPOOLS)
+    elif ("." + provisioner).endswith(".cephfs.csi.ceph.com"):
+        kind, name, source, key = ("filesystem", params.get("fsName", ""),
+                                   FILESYSTEMS, FILESYSTEMS)
+    else:
+        return None
+    row = {"class": _name(storage_class), "kind": kind, "backing": name,
+           "mirrored": None, "mirrorMode": ""}
+    if _state(reads, source) != OK:
+        row["why"] = "the %s list could not be read" % LABELS[key]
+        return row
+    found = [o for o in _items(reads, source) if _name(o) == name]
+    cluster_id = params.get("clusterID", "")
+    narrowed = [o for o in found if _namespace(o) == cluster_id]
+    found = narrowed or found
+    if not found:
+        row["why"] = "no %s named %s was found" % (
+            "pool" if kind == "block" else "filesystem", name or "(none)")
+        return row
+    mirroring = _get(found[0], "spec", "mirroring") or {}
+    row["mirrored"] = _is_true(mirroring.get("enabled"))
+    row["mirrorMode"] = mirroring.get("mode", "") if row["mirrored"] else ""
+    return row
+
+
+def _claims(reads, classes):
+    """Count and size of the claims per Ceph class, and how many of them
+    carry a VolumeReplication."""
+    replicated = {(_namespace(v), _get(v, "spec", "dataSource", "name"))
+                  for v in _items(reads, VOLREPS)}
+    out = {}
+    for claim in _items(reads, CLAIMS):
+        name = _get(claim, "spec", "storageClassName")
+        if name not in classes:
+            continue
+        got = out.setdefault(name, {"claims": 0, "bytes": 0, "replicated": 0})
+        got["claims"] += 1
+        got["bytes"] += quantity_bytes(
+            _get(claim, "status", "capacity", "storage")
+            or _get(claim, "spec", "resources", "requests", "storage"))
+        if (_namespace(claim), _name(claim)) in replicated:
+            got["replicated"] += 1
+    return out
+
+
+def _replication_rows(reads):
+    rows = []
+    for key in REPLICATION:
+        state = _state(reads, key)
+        if state == ABSENT:
+            word, count = "not installed", 0
+        elif state == UNKNOWN:
+            word, count = "unknown, needs read on %s" % key, 0
+        elif key == BLOCKPOOLS:
+            count = sum(1 for p in _items(reads, key)
+                        if _is_true(_get(p, "spec", "mirroring", "enabled")))
+            modes = sorted({_get(p, "spec", "mirroring", "mode") or "?"
+                            for p in _items(reads, key)
+                            if _is_true(_get(p, "spec", "mirroring",
+                                             "enabled"))})
+            word = ("present on %d of %d pools, mode %s" % (
+                count, len(_items(reads, key)), ", ".join(modes))
+                if count else "absent")
+        elif key == FILESYSTEMS:
+            count = sum(1 for f in _items(reads, key)
+                        if _is_true(_get(f, "spec", "mirroring", "enabled")))
+            word = ("present on %d of %d filesystems" % (
+                count, len(_items(reads, key))) if count else "absent")
+        else:
+            count = len(_items(reads, key))
+            word = "present (%d)" % count if count else "absent"
+        rows.append({"resource": key, "label": LABELS[key], "state": state,
+                     "count": count, "text": word})
+    return rows
+
+
+def _policy_kinds(reads):
+    sync, asynchronous = 0, 0
+    for policy in _items(reads, DRPOLICIES):
+        interval = _get(policy, "spec", "schedulingInterval")
+        if interval is None:
+            continue
+        if str(interval).strip().lower() in _ZERO_INTERVALS:
+            sync += 1
+        else:
+            asynchronous += 1
+    return sync, asynchronous
+
+
+def analyse(reads):
+    """The whole topology as a dict. ``reads`` maps each name in RESOURCES to
+    ``read(...)``. A name that is missing counts as unknown."""
+    facts = _cluster_facts(reads)
+    domains = _domains(reads, facts)
+    rows = _replication_rows(reads)
+    by_key = {r["resource"]: r for r in rows}
+    ceph_classes = []
+    for storage_class in _items(reads, STORAGECLASSES):
+        row = _backing(storage_class, reads)
+        if row:
+            ceph_classes.append(row)
+    sizes = _claims(reads, {c["class"] for c in ceph_classes})
+    for row in ceph_classes:
+        row.update(sizes.get(row["class"],
+                             {"claims": 0, "bytes": 0, "replicated": 0}))
+    sync_policies, async_policies = _policy_kinds(reads)
+
+    stretch_signals = []
+    for s in facts["rookStretch"]:
+        stretch_signals.append(
+            "Rook stretch mode on %s, zones %s%s" % (
+                s["cluster"] or "a CephCluster", ", ".join(s["zones"]),
+                (", arbiter %s" % ", ".join(s["arbiter"]))
+                if s["arbiter"] else ""))
+    if facts["odfArbiter"]:
+        stretch_signals.append("ODF arbiter enabled")
+    if sync_policies:
+        stretch_signals.append("%d ODF DRPolicy with a zero scheduling "
+                               "interval, which is synchronous" % sync_policies)
+
+    async_signals = []
+    if by_key[BLOCKPOOLS]["count"]:
+        async_signals.append("RBD mirroring on a CephBlockPool")
+    if by_key[FILESYSTEMS]["count"]:
+        async_signals.append("mirroring on a CephFilesystem")
+    for key, text in ((RBDMIRRORS, "a CephRBDMirror daemon"),
+                      (FSMIRRORS, "a CephFilesystemMirror daemon"),
+                      (VOLREPS, "VolumeReplication objects"),
+                      (VOLREPCLASSES, "a VolumeReplicationClass")):
+        if by_key[key]["count"]:
+            async_signals.append(text)
+    if async_policies:
+        async_signals.append("%d ODF DRPolicy with a scheduling interval"
+                             % async_policies)
+    if by_key[DRPCS]["count"] and not stretch_signals:
+        async_signals.append("ODF DRPlacementControl objects")
+
+    needs = [r["resource"] for r in rows if r["state"] == UNKNOWN]
+    cluster_needs = [k for k in (CEPHCLUSTERS, STORAGECLUSTERS)
+                     if _state(reads, k) == UNKNOWN]
+    cluster_needs += [k for k in (STORAGECLASSES,)
+                      if _state(reads, k) == UNKNOWN]
+    ceph_found = bool(facts["clusters"] or ceph_classes)
+    external = ceph_classes and not facts["clusters"]
+
+    if stretch_signals:
+        verdict, summary = "stretch", SUMMARY_STRETCH
+    elif async_signals:
+        verdict, summary = "async", SUMMARY_ASYNC
+    elif cluster_needs and not ceph_found:
+        verdict = "unknown"
+        summary = "unknown: needs read on %s" % ", ".join(cluster_needs)
+    elif not ceph_found:
+        verdict, summary = "none", "no Ceph or ODF storage found on this cluster"
+    elif external:
+        verdict = "unknown"
+        summary = ("unknown: Ceph CSI classes exist but no Rook or ODF "
+                   "cluster object does, so the Ceph is external and its "
+                   "layout cannot be read from Kubernetes")
+    elif needs or cluster_needs:
+        verdict = "unknown"
+        summary = "unknown: needs read on %s" % ", ".join(
+            cluster_needs + needs)
+    else:
+        verdict, summary = "independent", SUMMARY_INDEPENDENT
+
+    caveats = []
+    if verdict in ("stretch", "async") and (needs or cluster_needs):
+        caveats.append("Some reads were refused, so more may exist: needs "
+                       "read on %s" % ", ".join(cluster_needs + needs))
+    if verdict == "stretch" and async_signals:
+        caveats.append("Asynchronous replication was found as well: "
+                       + ", ".join(async_signals))
+    if verdict in ("async", "independent"):
+        caveats.append("Read from this cluster only. The peer cluster was "
+                       "not queried, so the other side of a replication "
+                       "is not confirmed")
+    return {"verdict": verdict, "summary": summary,
+            "implication": IMPLICATIONS[verdict],
+            "signals": stretch_signals if verdict == "stretch"
+            else async_signals,
+            "caveats": caveats, "cluster": facts, "domains": domains,
+            "replication": rows, "classes": ceph_classes,
+            "needs": cluster_needs + needs}
+
+
+def lines(found):
+    """The report lines, without indentation."""
+    out = ["Topology: %s" % found["summary"]]
+    for text in found["signals"]:
+        out.append("  seen: %s" % text)
+    cluster = found["cluster"]
+    if found["verdict"] != "none" or cluster["clusters"]:
+        facts = []
+        if cluster["failureDomain"]:
+            facts.append("failure domain %s" % cluster["failureDomain"])
+        if cluster["flexibleScaling"]:
+            facts.append("flexible scaling on")
+        if cluster["odfArbiter"]:
+            facts.append("arbiter on")
+        if facts:
+            out.append("  ODF: %s" % ", ".join(facts))
+        domains = found["domains"]
+        if domains["read"]:
+            out.append("  failure domains by node label %s: %d (%s)" % (
+                domains["key"], len(domains["values"]),
+                ", ".join(domains["values"]) or "no node carries it"))
+        else:
+            out.append("  failure domains: unknown, needs read on nodes")
+        for row in found["replication"]:
+            out.append("  %-26s %s" % (row["label"], row["text"]))
+    for row in found["classes"]:
+        if row["mirrored"] is None:
+            where = "mirroring unknown, %s" % row.get("why", "")
+        else:
+            where = "mirrored" if row["mirrored"] else "not mirrored"
+            if row["mirrorMode"]:
+                where += ", mode %s" % row["mirrorMode"]
+        if found["cluster"]["rookStretch"] or found["cluster"]["odfArbiter"]:
+            where += ", stretched"
+        out.append("  class %s: %s %s, %s, %d claim(s), %s%s" % (
+            row["class"], row["kind"], row["backing"] or "(unnamed)", where,
+            row["claims"], human(row["bytes"]),
+            (", %d with a VolumeReplication" % row["replicated"])
+            if row["replicated"] else ""))
+    for text in found["caveats"]:
+        out.append("  note: %s" % text)
+    if found["implication"]:
+        out.append("For the NetApp target: %s" % found["implication"])
+    return out
+
+
+def from_directory(path):
+    """Reads saved by the shell: ``<name>.json`` and ``<name>.state``, where
+    the state file holds ok, absent, or unknown followed by the reason."""
+    reads = {}
+    for key in RESOURCES:
+        try:
+            with open(os.path.join(path, key + ".state")) as handle:
+                state = handle.read().strip()
+        except OSError:
+            reads[key] = read(UNKNOWN, why="not read")
+            continue
+        word, _sep, why = state.partition(" ")
+        if word == OK:
+            try:
+                with open(os.path.join(path, key + ".json")) as handle:
+                    items = json.load(handle).get("items") or []
+                reads[key] = read(OK, items)
+            except (OSError, ValueError):
+                reads[key] = read(UNKNOWN, why="the answer was not JSON")
+        else:
+            reads[key] = read(ABSENT if word == ABSENT else UNKNOWN,
+                              why=why)
+    return reads
+
+
+def main(argv):
+    if not argv:
+        print("usage: cephtopology DIRECTORY")
+        return 2
+    for line in lines(analyse(from_directory(argv[0]))):
+        print("   " + line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+TP_CEPH_PY
+fi
+[ -n "$TP_CEPH_DIR" ] && rm -rf "$TP_CEPH_DIR"
 
 echo
 echo "-- What is on the array behind each claim --"
@@ -1773,6 +2372,244 @@ else
   echo "   Ask whoever has the array for those four, or re-run with:"
   echo "     ONTAP_MGMT_LIF=<lif> ONTAP_USER=admin ./tp-pre.sh   (asks for the password)"
   echo "   (through a tunnel: ONTAP_API_BASE=https://127.0.0.1:9443/api)"
+fi
+
+# ── Which NFS server is behind each NFS volume, and which versions it answers ─
+#
+# Asked BEFORE anything is migrated because the answer decides the copy engine
+# and with it how long the application is stopped. A server that answers
+# NFSv3 lets XCP copy while the application runs. One that only answers
+# NFSv4 lets XCP run only with the application stopped. Anything else, and
+# anything not checked, gets the standard engine.
+#
+# Read-only, in two parts. The volumes come from PersistentVolumes, never from
+# a pod. The versions are asked of the server itself, FROM THIS MACHINE, with
+# the ONC RPC NULL procedure of the NFS program (100003), version 3 and then
+# 4. NULL does nothing on the server and carries no data. Nothing is mounted
+# and nothing is written, here or on the server. The order is rpcinfo, then
+# python3 doing the same call by hand on TCP 2049, then "not checked". A
+# machine that does not reach the server says so, and says what to run from a
+# node that does. "Not checked" is never "no NFSv3".
+#
+# It proves the server ANSWERS a version. It does not prove an export may be
+# mounted over it, because an export policy can refuse a client whatever the
+# protocol says. Nothing is downloaded: a missing tool is named and skipped.
+TP_NFS_PY='
+import os, socket, struct, sys
+PORT = int(os.environ.get("TP_NFS_PORT") or 2049)
+WAIT = float(os.environ.get("TP_NFS_WAIT") or 5)
+def _read(sock, n):
+    data = b""
+    while len(data) < n:
+        got = sock.recv(n - len(data))
+        if not got:
+            raise OSError("the server closed the connection")
+        data += got
+    return data
+def null_call(sock, vers):
+    xid = 0x74700000 + vers
+    body = struct.pack(">6I", xid, 0, 2, 100003, vers, 0)
+    body += struct.pack(">4I", 0, 0, 0, 0)
+    sock.sendall(struct.pack(">I", 0x80000000 | len(body)) + body)
+    head = struct.unpack(">I", _read(sock, 4))[0]
+    if not head & 0x80000000:
+        return "unknown"
+    data = _read(sock, head & 0x7FFFFFFF)
+    if len(data) < 24:
+        return "unknown"
+    got_xid, mtype, rstat = struct.unpack(">3I", data[:12])
+    if got_xid != xid or mtype != 1 or rstat != 0:
+        return "unknown"
+    vlen = struct.unpack(">I", data[16:20])[0]
+    at = 20 + ((vlen + 3) // 4) * 4
+    if len(data) < at + 4:
+        return "unknown"
+    accepted = struct.unpack(">I", data[at:at + 4])[0]
+    if accepted == 0:
+        return "yes"
+    if accepted in (1, 2):
+        return "no"
+    return "unknown"
+server = sys.argv[1]
+try:
+    sock = socket.create_connection((server, PORT), timeout=WAIT)
+except Exception:
+    print("v3=unknown v4=unknown")
+    raise SystemExit(0)
+seen = {}
+for vers in (3, 4):
+    try:
+        sock.settimeout(WAIT)
+        seen[vers] = null_call(sock, vers)
+    except Exception:
+        seen[vers] = "unknown"
+        break
+sock.close()
+print("v3=%s v4=%s" % (seen.get(3, "unknown"), seen.get(4, "unknown")))
+'
+
+# tp_nfs_probe <server> — sets TP_NFS_V3 and TP_NFS_V4 to yes, no or unknown,
+# and TP_NFS_HOW to the tool that answered (empty when none did).
+tp_nfs_probe() {
+  local srv="$1" v out
+  TP_NFS_V3=unknown; TP_NFS_V4=unknown; TP_NFS_HOW=""
+  local TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 10"
+  if command -v rpcinfo >/dev/null 2>&1; then
+    for v in 3 4; do
+      out=$($TO rpcinfo -T tcp "$srv" 100003 "$v" 2>&1)
+      case "$out" in
+        *"ready and waiting"*) eval "TP_NFS_V$v=yes" ;;
+        *"is not available"*|*"version mismatch"*) eval "TP_NFS_V$v=no" ;;
+      esac
+    done
+    if [ "$TP_NFS_V3" != unknown ] || [ "$TP_NFS_V4" != unknown ]; then
+      TP_NFS_HOW="rpcinfo"; return 0
+    fi
+    # rpcinfo asks the portmapper, which a server that only serves NFSv4 may
+    # not run. The same question straight to port 2049 is still worth asking.
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    out=$($TO python3 -I -c "$TP_NFS_PY" "$srv" 2>/dev/null)
+    case "$out" in
+      v3=*" v4="*)
+        TP_NFS_V3=${out#v3=}; TP_NFS_V3=${TP_NFS_V3%% *}
+        TP_NFS_V4=${out##*v4=}
+        if [ "$TP_NFS_V3" != unknown ] || [ "$TP_NFS_V4" != unknown ]; then
+          TP_NFS_HOW="python3"; return 0
+        fi
+        TP_NFS_V3=unknown; TP_NFS_V4=unknown ;;
+    esac
+  fi
+  return 0
+}
+
+# The same words the product's assessment uses.
+tp_nfs_engine() {   # <v3> <v4> <checked: 0|1>
+  if [ "$3" != 1 ] || [ "$1" = unknown ]; then
+    echo "standard engine (NFS versions not checked)"
+  elif [ "$1" = yes ]; then echo "XCP live (NFSv3 reachable)"
+  elif [ "$2" = yes ]; then echo "XCP only with the application stopped (NFSv4 only)"
+  else echo "standard engine (neither NFSv3 nor NFSv4 answered)"
+  fi
+}
+
+tp_nfs_versions() {  # <v3> <v4> <checked: 0|1>
+  [ "$3" = 1 ] || { echo "not checked from this machine"; return; }
+  local names="" unk=""
+  [ "$1" = yes ] && names="NFSv3"
+  [ "$2" = yes ] && names="${names:+$names and }NFSv4"
+  [ "$1" = unknown ] && unk="NFSv3"
+  [ "$2" = unknown ] && unk="${unk:+$unk and }NFSv4"
+  [ -n "$names" ] || names="neither NFSv3 nor NFSv4"
+  [ -n "$unk" ] && names="$names ($unk not checked)"
+  echo "$names"
+}
+
+echo
+echo "-- NFS servers behind the claims (read-only, asked from this machine) --"
+if ! $HAVE_JQ; then
+  echo "   skipped: jq is missing here, and the volumes cannot be read without it."
+else
+  TP_NFS_DIR=$(mktemp -d 2>/dev/null || echo "")
+  TP_NFS_ROWS=""
+  TP_NFS_OK=0
+  if [ -n "$TP_NFS_DIR" ] \
+     && $K get pv -o json >"$TP_NFS_DIR/pv" 2>/dev/null \
+     && $K get sc -o json >"$TP_NFS_DIR/sc" 2>/dev/null; then
+    TP_NFS_OK=1
+    TP_NFS_ROWS=$(jq -r --slurpfile sc "$TP_NFS_DIR/sc" '
+      ($sc[0].items // []) as $scs
+      | def nfsinfo:
+          if .spec.nfs then {server: .spec.nfs.server, path: (.spec.nfs.path // "-")}
+          elif ((.spec.csi.driver // "") | test("nfs"))
+               and ((.spec.csi.volumeAttributes.server // "") != "")
+            then {server: .spec.csi.volumeAttributes.server,
+                  path: (.spec.csi.volumeAttributes.share // "-")}
+          else empty end;
+        def pin: [ .[]? | select(test("^(nfs)?vers=")) ];
+        [ .items[]? | select(.status.phase == "Bound") | . as $pv | nfsinfo as $n
+          | {server: $n.server, path: $n.path,
+             ns: ($pv.spec.claimRef.namespace // "-"),
+             claim: (($pv.spec.claimRef.namespace // "-") + "/" + ($pv.spec.claimRef.name // "-")),
+             pins: (((($pv.spec.mountOptions // []) | pin)
+                     + ([ $scs[]? | select(.metadata.name == ($pv.spec.storageClassName // ""))
+                          | (.mountOptions // []) | pin ] | add // [])) | unique)} ]
+        | group_by(.server)[]
+        | [ .[0].server,
+            (map(.claim) | unique | length),
+            (map(.ns) | unique | length),
+            (map(.path) | unique | .[0:4] | join(",")),
+            ((map(.pins[]) | unique | join(",")) | if . == "" then "-" else . end) ]
+        | @tsv' "$TP_NFS_DIR/pv" 2>/dev/null)
+  fi
+  if [ "$TP_NFS_OK" != 1 ]; then
+    echo "   unknown: the PersistentVolumes or the StorageClasses could not be read."
+  elif [ -z "$TP_NFS_ROWS" ]; then
+    echo "   none: no bound PersistentVolume points at an NFS server."
+  else
+    # Which servers are an ONTAP the script already knows about. First the
+    # data LIFs of Trident backends already in the cluster, then, when the
+    # array credentials are set, the array itself.
+    TP_NFS_LIFS=$($K get tbc -A -o json 2>/dev/null | jq -r '.items[]? |
+      "\(.spec.dataLIF // "") \(.metadata.name) \(.spec.svm // "-")"' 2>/dev/null)
+    TP_NFS_TABLE=""
+    TP_NFS_N=0
+    while IFS=$'\t' read -r SRV NCLAIM NNS EXPORTS PINS; do
+      [ -n "$SRV" ] || continue
+      TP_NFS_N=$((TP_NFS_N + 1))
+      [ "$TP_NFS_N" -gt 30 ] && continue
+      tp_nfs_probe "$SRV"
+      CHK=0; [ -n "$TP_NFS_HOW" ] && CHK=1
+      VER=$(tp_nfs_versions "$TP_NFS_V3" "$TP_NFS_V4" "$CHK")
+      ENG=$(tp_nfs_engine "$TP_NFS_V3" "$TP_NFS_V4" "$CHK")
+      VENDOR="vendor not known"
+      LIF=$(printf '%s\n' "$TP_NFS_LIFS" | awk -v s="$SRV" '$1 == s {print $2 " SVM " $3; exit}')
+      if [ -n "$LIF" ]; then
+        VENDOR="ONTAP (data LIF of Trident backend ${LIF})"
+      elif [ -n "${ONTAP_BASE:-}" ] && [ -n "${ONTAP_PASS:-}" ]; then
+        RESP=$(curl -sk --max-time 15 -u "${ONTAP_USER:-admin}:${ONTAP_PASS}" \
+          "$ONTAP_BASE/network/ip/interfaces?ip.address=${SRV}&fields=svm.name" 2>/dev/null)
+        NREC=$(printf '%s' "$RESP" | jq -r '.num_records // "x"' 2>/dev/null)
+        if [ -z "$NREC" ] || [ "$NREC" = "x" ]; then
+          VENDOR="vendor not known (the array did not answer)"
+        elif [ "$NREC" != "0" ]; then
+          VENDOR="ONTAP (SVM $(printf '%s' "$RESP" | jq -r '.records[0].svm.name // "-"'))"
+        else
+          VENDOR="not a data LIF of the ONTAP asked"
+        fi
+      fi
+      TP_NFS_TABLE="${TP_NFS_TABLE}${SRV}"$'\t'"${VER}"$'\t'"${NCLAIM}"$'\t'"${NNS}"$'\t'"${VENDOR}"$'\t'"${ENG}"$'\t'"${EXPORTS}"$'\t'"${PINS}"$'\t'"${TP_NFS_HOW:--}"$'\n'
+    done <<<"$TP_NFS_ROWS"
+    printf '%s' "$TP_NFS_TABLE" | awk -F'\t' '
+      BEGIN { printf "   %-22s %-34s %6s %4s  %s\n", "SERVER", "VERSIONS ANSWERED", "CLAIMS", "NS", "COPY ENGINE" }
+      { printf "   %-22s %-34s %6s %4s  %s\n", $1, $2, $3, $4, $6 }'
+    echo
+    printf '%s' "$TP_NFS_TABLE" | while IFS=$'\t' read -r SRV VER NCLAIM NNS VENDOR ENG EXPORTS PINS HOW; do
+      echo "   $SRV   $VENDOR"
+      echo "     exports:  $EXPORTS"
+      echo "     mount options naming a version (PV or class):  $PINS"
+      if [ "$HOW" = "-" ]; then
+        echo "     not checked from this machine. From a node that reaches the server, run:"
+        echo "       rpcinfo -T tcp $SRV 100003 3"
+        echo "       rpcinfo -T tcp $SRV 100003 4"
+        echo "     'ready and waiting' means the server answers that version."
+      else
+        echo "     versions asked with: $HOW"
+      fi
+    done
+    [ "$TP_NFS_N" -gt 30 ] && echo "   ... and $((TP_NFS_N - 30)) more servers, not asked (30 at most)."
+    if ! command -v rpcinfo >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+      echo "   Neither rpcinfo nor python3 is installed here, so no server was asked."
+    fi
+    echo
+    echo "   Why it matters for the copy time: a server that answers NFSv3 lets the"
+    echo "   copy run while the application keeps running, and only a short stop is"
+    echo "   left for the cutover. A server that answers only NFSv4 can be copied"
+    echo "   fast only with the application stopped for the whole copy, so the"
+    echo "   window is as long as the copy. Not checked means the standard engine"
+    echo "   is assumed, and the copy pods find out the rest before anything stops."
+  fi
+  [ -n "$TP_NFS_DIR" ] && rm -rf "$TP_NFS_DIR"
 fi
 
 # ============================================================================

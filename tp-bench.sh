@@ -78,7 +78,7 @@ set -uo pipefail
 
 readonly NS=tp-bench
 readonly OWNER_LABEL="app.kubernetes.io/managed-by=tp-bench"
-readonly RSYNC_FLAGS="-aH --numeric-ids --sparse --inplace --delete --stats --exclude=/lost+found --exclude=/.snapshot"
+readonly RSYNC_FLAGS="-aH --numeric-ids --sparse --inplace --delete --stats --exclude=/trident_pvc_* --exclude=/.snapshot --exclude=/lost+found"
 DEFAULT_IMAGE="ghcr.io/calzdevops/trident-port:v1.2.12"
 
 BENCH=false
@@ -108,7 +108,7 @@ read -r -d '' RUNNER <<'RUNNER_EOF'
 set -u
 SRC="${TPB_SRC:-/src}"
 DST="${TPB_DST:-/dst}"
-RSYNC_FLAGS="${TPB_RSYNC_FLAGS:--aH --numeric-ids --sparse --inplace --delete --stats --exclude=/lost+found --exclude=/.snapshot}"
+RSYNC_FLAGS="${TPB_RSYNC_FLAGS:--aH --numeric-ids --sparse --inplace --delete --stats --exclude=/trident_pvc_* --exclude=/.snapshot --exclude=/lost+found}"
 TMPD="$(mktemp -d)"
 now_ms() { date +%s%3N; }
 emit() { echo "TPB $1"; }
