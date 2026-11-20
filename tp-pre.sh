@@ -187,6 +187,77 @@ tp_fit_verdict() {
   fi
 }
 
+# ── A READ THAT FAILED IS NOT AN ABSENCE ────────────────────────────────────
+#
+# Every read below that goes through tp_read keeps three answers apart: it
+# answered, the resource type does not exist on this cluster (an absence), or
+# the read failed (RBAC, an unreachable API, a timeout). The third is printed
+# as "unknown ... could not be read (<why>)", taken from the command's own
+# stderr or its exit status, and is counted in the closing lines. It is never
+# printed as "none" or as 0. The script goes on after it, and its own exit
+# status stays 0.
+#
+# tp_read <what> <outfile> <command...>
+# BEGIN tp_read helpers (the tests lift this block, so keep it self-contained)
+#   returns 0 answered, 1 failed (and says so), 2 the resource type is absent
+TP_RUN=$$
+TP_RD_DIR=$(mktemp -d 2>/dev/null || echo "")
+TP_RD="${TP_RD_DIR:-/tmp}"
+TP_UNREAD_LOG="$TP_RD/tp-unread.$TP_RUN.log"
+: > "$TP_UNREAD_LOG" 2>/dev/null || TP_UNREAD_LOG=/dev/null
+tp_why_of() {
+  _y=$(grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 1 | cut -c1-160)
+  [ -n "$_y" ] || _y="exit status $2"
+  printf '%s' "$_y"
+}
+tp_note_unread() {
+  printf '%s\t%s\n' "$1" "$2" >> "$TP_UNREAD_LOG" 2>/dev/null
+}
+tp_read() {
+  _w=$1; _o=$2; shift 2
+  _e="${_o}.err"
+  "$@" >"$_o" 2>"$_e"; _rc=$?
+  if [ "$_rc" -eq 0 ]; then rm -f "$_e"; return 0; fi
+  if grep -qiE "doesn't have a resource type|the server could not find the requested resource|no matches for kind|\(NotFound\)" "$_e" 2>/dev/null; then
+    rm -f "$_e"; : > "$_o"; return 2
+  fi
+  _y=$(tp_why_of "$_e" "$_rc"); rm -f "$_e"; : > "$_o"
+  tp_note_unread "$_w" "$_y"
+  [ -n "${TP_RD_QUIET:-}" ] || printf '   unknown: %s could not be read (%s).\n' "$_w" "$_y"
+  return 1
+}
+# tp_show <what> <command...>: the same, and the rows are printed indented.
+# Returns what tp_read returns, so the caller can say "absent" itself.
+tp_show() {
+  _what=$1; shift
+  tp_read "$_what" "$TP_RD/tp-show.$TP_RUN" "$@"; _src=$?
+  if [ "$_src" -eq 0 ] && [ -s "$TP_RD/tp-show.$TP_RUN" ]; then sed 's/^/   /' "$TP_RD/tp-show.$TP_RUN"; fi
+  rm -f "$TP_RD/tp-show.$TP_RUN"
+  return $_src
+}
+# The number of reads that failed, for the closing lines.
+tp_unread_count() { if [ -s "$TP_UNREAD_LOG" ]; then sort -u "$TP_UNREAD_LOG" | wc -l | tr -d ' '; else echo 0; fi; }
+# Why the owners of a namespace could not be worked out, or nothing when they
+# could. tp_operator_owners runs inside command substitutions, so it cannot
+# print a line of its own without that line being read as an operator. It
+# leaves the reason in a file, and the caller asks for it.
+tp_owners_why() {
+  head -n 1 "$TP_RD/tp-owners.$TP_RUN.$1" 2>/dev/null
+}
+# tp_can_i <what> <kubectl auth can-i arguments...>
+# Prints yes or no when the API answered, and says it could not be read when it
+# did not. `can-i` exits 1 for "no", so the exit status alone cannot tell.
+tp_can_i() {
+  _cw=$1; shift
+  _cout=$($K auth can-i "$@" 2>"$TP_RD/tp-cani.$TP_RUN"); _crc=$?
+  _cout=$(printf '%s\n' "$_cout" | grep -E '^(yes|no)' | head -n 1)
+  if [ -n "$_cout" ]; then rm -f "$TP_RD/tp-cani.$TP_RUN"; echo "$_cout"; return 0; fi
+  _cy=$(tp_why_of "$TP_RD/tp-cani.$TP_RUN" "$_crc"); rm -f "$TP_RD/tp-cani.$TP_RUN"
+  tp_note_unread "$_cw" "$_cy"
+  echo "unknown ($_cw could not be read: $_cy)"
+}
+# END tp_read helpers
+
 # ── WHO OWNS A WORKLOAD ─────────────────────────────────────────────────────
 #
 # THE SAME QUESTION THE ENGINE ASKS, ASKED THE SAME WAY.
@@ -384,14 +455,27 @@ tp_operator_owners() {
   _ns=$1; _wfile=${2:-}; _want=true
   [ "${3:-}" = "unclaimed" ] && _want=false
   $HAVE_JQ || return 0
+  _owhy="$TP_RD/tp-owners.$TP_RUN.$_ns"; rm -f "$_owhy"
   if [ -n "$_wfile" ] && [ -s "$_wfile" ]; then
     _wjson=$(cat "$_wfile")
   else
-    _wjson=$($K get deploy,sts,ds -n "$_ns" -o json 2>/dev/null)
+    TP_RD_QUIET=1 tp_read "the workloads of namespace $_ns" "$TP_RD/tp-ow.$TP_RUN" $K get deploy,sts,ds -n "$_ns" -o json
+    _wjson=$(cat "$TP_RD/tp-ow.$TP_RUN" 2>/dev/null)
+    rm -f "$TP_RD/tp-ow.$TP_RUN"
   fi
-  [ -n "$_wjson" ] || return 0
+  if [ -z "$_wjson" ]; then
+    # No document at all: the answer is "unknown", and never "no operator".
+    if [ -z "$_wfile" ] || [ ! -s "$_wfile" ]; then
+      _w=$(tail -n 1 "$TP_UNREAD_LOG" 2>/dev/null | cut -f2)
+      echo "the workload list could not be read (${_w:-no answer})" > "$_owhy"
+    else
+      echo "the workload list could not be read" > "$_owhy"
+    fi
+    return 0
+  fi
 
-  printf '%s' "$_wjson" | jq -r "$TP_JQ_OWNERS"'
+  _jerr="$TP_RD/tp-jerr.$TP_RUN"
+  _ownrows=$(printf '%s' "$_wjson" | jq -r "$TP_JQ_OWNERS"'
     .items[]? | select(tp_holds_claim == $want) | tp_operator_refs
     | . as $r
     | "\($r.kind)\t\($r.name)\t"
@@ -399,7 +483,16 @@ tp_operator_owners() {
             and (($r.apiVersion // "") | split("/") | .[0]) == $ourgroup
          then "ours" else "owns it" end)' \
     --arg ourkind "$TP_OUR_OWN_KIND" --arg ourgroup "$TP_OUR_OWN_GROUP" \
-    --argjson want "$_want" 2>/dev/null | sort -u
+    --argjson want "$_want" 2>"$_jerr"); _jrc=$?
+  if [ "$_jrc" -ne 0 ]; then
+    _y=$(tp_why_of "$_jerr" "$_jrc")
+    echo "jq could not read the workload list ($_y)" > "$_owhy"
+    tp_note_unread "the operators of namespace $_ns" "jq failed: $_y"
+    rm -f "$_jerr"
+    return 0
+  fi
+  rm -f "$_jerr"
+  [ -n "$_ownrows" ] && printf '%s\n' "$_ownrows" | sort -u
 
   # PODS WHOSE CONTROLLER IS A CUSTOM RESOURCE. Some operators run their pods
   # through a resource of their own (a pod set) that is neither a Deployment
@@ -408,7 +501,13 @@ tp_operator_owners() {
   # ownerReferences, through custom resources only, to the last owner that can
   # be read, which is the resource the user wrote. Only for claim holders.
   if [ "$_want" = true ]; then
-    _pjson=$($K get pods -n "$_ns" -o json 2>/dev/null)
+    if TP_RD_QUIET=1 tp_read "the pods of namespace $_ns" "$TP_RD/tp-op.$TP_RUN" $K get pods -n "$_ns" -o json; then
+      _pjson=$(cat "$TP_RD/tp-op.$TP_RUN" 2>/dev/null)
+    else
+      _pjson=""
+      echo "the pod list could not be read ($(tail -n 1 "$TP_UNREAD_LOG" 2>/dev/null | cut -f2))" >> "$_owhy"
+    fi
+    rm -f "$TP_RD/tp-op.$TP_RUN"
     if [ -n "$_pjson" ]; then
       printf '%s' "$_pjson" | jq -r "$TP_JQ_OWNERS"'
         .items[]? | select([(.spec.volumes // [])[] | select(.persistentVolumeClaim)] | length > 0)
@@ -418,9 +517,14 @@ tp_operator_owners() {
           _hops=0
           while [ "$_hops" -lt 4 ]; do
             _grp=${_av%%/*}; [ "$_grp" = "$_av" ] && _grp=""
-            _up=$($K get "$_ok.$_grp" "$_on" -n "$_ns" -o json 2>/dev/null | jq -r "$TP_JQ_OWNERS"'
+            TP_RD_QUIET=1 tp_read "the custom resource $_ok/$_on of namespace $_ns" "$TP_RD/tp-up.$TP_RUN" $K get "$_ok.$_grp" "$_on" -n "$_ns" -o json
+            if [ $? -eq 1 ]; then
+              echo "the owner of $_ok/$_on could not be followed ($(tail -n 1 "$TP_UNREAD_LOG" 2>/dev/null | cut -f2))" >> "$_owhy"
+            fi
+            _up=$(jq -r "$TP_JQ_OWNERS"'
               ([(.items[]? // .) | tp_operator_refs] | first) // empty
-              | "\(.apiVersion)\t\(.kind)\t\(.name)"' 2>/dev/null)
+              | "\(.apiVersion)\t\(.kind)\t\(.name)"' < "$TP_RD/tp-up.$TP_RUN" 2>/dev/null)
+            rm -f "$TP_RD/tp-up.$TP_RUN"
             [ -n "$_up" ] || break
             IFS=$'\t' read -r _av _ok _on <<TP_UP
 $_up
@@ -451,9 +555,13 @@ TP_UP
     for _name in $_cands; do
       # The confirmation. Without it a copied label stops an application
       # through a custom resource that is not there.
-      $K get "$_res" "$_name" -n "$_ns" >/dev/null 2>&1 \
-        && printf '%s\t%s\t%s\n' "$_kind" "$_name" \
-             "manages it by label; no ownerReference"
+      TP_RD_QUIET=1 tp_read "the custom resource $_res/$_name of namespace $_ns" "$TP_RD/tp-cr.$TP_RUN" $K get "$_res" "$_name" -n "$_ns"
+      case $? in
+        0) printf '%s\t%s\t%s\n' "$_kind" "$_name" \
+             "manages it by label; no ownerReference" ;;
+        1) echo "the custom resource $_res/$_name could not be confirmed ($(tail -n 1 "$TP_UNREAD_LOG" 2>/dev/null | cut -f2))" >> "$_owhy" ;;
+      esac
+      rm -f "$TP_RD/tp-cr.$TP_RUN"
     done
   done <<TP_CONVENTIONS
 $(printf '%s\n' $TP_OWNERSHIP_CONVENTIONS)
@@ -495,11 +603,12 @@ tp_argo_read() {
     if $HAVE_JQ && jq -e '.items | type == "array"' "$_file" >/dev/null 2>&1; then
       rm -f "$_errf"; echo ok; return 0
     fi
-    rm -f "$_errf"; echo unreadable; return 0
+    rm -f "$_errf"; tp_note_unread "the $_res list" "the answer was not a list"; echo unreadable; return 0
   fi
   if grep -qiE "doesn't have a resource type|the server could not find the requested resource" "$_errf" 2>/dev/null; then
     rm -f "$_errf"; echo absent; return 0
   fi
+  tp_note_unread "the $_res list" "$(tp_why_of "$_errf" 1)"
   rm -f "$_errf"; echo unreadable
 }
 
@@ -576,6 +685,7 @@ tp_argo_probe() {
           | select(any((.metadata.ownerReferences // [])[]?; .kind == "Workflow" and (((.apiVersion // "") | split("/")[0]) == "argoproj.io"))
                    or (((.metadata.labels // {})["workflows.argoproj.io/workflow"] // "") != ""))] | length' "$_tmp.pvc")"
       else
+        tp_note_unread "the claim list (Argo Workflows ownership)" "could not be listed or parsed"
         echo "   Claims owned by Workflows: unreadable (could not list persistentvolumeclaims)"
       fi ;;
   esac
@@ -595,7 +705,13 @@ $HAVE_JQ || echo "  NOTE: jq is missing. The per-claim detail and the CSV need i
 if [ -n "$NS_FILTER" ]; then
   NAMESPACES=$(echo "$NS_FILTER" | tr ',' ' ')
 else
-  NAMESPACES=$($K get pvc -A --no-headers 2>/dev/null | awk '{print $1}' | sort -u)
+  TP_NS_UNREAD=""
+  if tp_read "the claim list (needed to find the namespaces)" "$TP_RD/tp-ns.$TP_RUN" $K get pvc -A --no-headers; then
+    NAMESPACES=$(awk '{print $1}' "$TP_RD/tp-ns.$TP_RUN" | sort -u)
+  else
+    NAMESPACES=""; TP_NS_UNREAD=$(tail -n 1 "$TP_UNREAD_LOG" | cut -f2)
+  fi
+  rm -f "$TP_RD/tp-ns.$TP_RUN"
 fi
 NS_COUNT=$(echo "$NAMESPACES" | tr ' ' '\n' | grep -c . || echo 0)
 
@@ -629,12 +745,23 @@ sec "A. CAN THIS CLUSTER MIGRATE AT ALL"
 echo "-- Was the estate still changing while this ran? --"
 CUTOFF=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
 if $HAVE_JQ && [ -n "$CUTOFF" ]; then
-  YOUNG=$($K get deploy,sts,ds -A -o json 2>/dev/null | jq -r --arg cutoff "$CUTOFF" '
-    .items[]?
-    | select(((.metadata.creationTimestamp // "") | length) > 0)
-    | select(.metadata.creationTimestamp > $cutoff)
-    | "     \(.metadata.namespace)/\(.kind)/\(.metadata.name)"' 2>/dev/null)
-  if [ -n "$YOUNG" ]; then
+  YOUNG=""; TP_YOUNG_OK=true
+  if tp_read "the workload list (cluster-wide)" "$TP_RD/tp-young.$TP_RUN" $K get deploy,sts,ds -A -o json; then
+    YOUNG=$(jq -r --arg cutoff "$CUTOFF" '
+      .items[]?
+      | select(((.metadata.creationTimestamp // "") | length) > 0)
+      | select(.metadata.creationTimestamp > $cutoff)
+      | "     \(.metadata.namespace)/\(.kind)/\(.metadata.name)"' "$TP_RD/tp-young.$TP_RUN" 2>/dev/null) || {
+      TP_YOUNG_OK=false; tp_note_unread "the workload list (cluster-wide)" "jq could not parse it"
+      echo "   unknown: the workload list could not be parsed, so recent changes were not checked."; }
+  else
+    TP_YOUNG_OK=false
+    echo "   NOT CHECKED. Do not read this as 'nothing moved'."
+  fi
+  rm -f "$TP_RD/tp-young.$TP_RUN"
+  if ! $TP_YOUNG_OK; then
+    :
+  elif [ -n "$YOUNG" ]; then
     echo "   *** WORKLOADS CREATED IN THE LAST 10 MINUTES ***"
     echo "$YOUNG" | head -12
     echo "     This inventory is a snapshot of a moving estate. Anything"
@@ -654,7 +781,13 @@ fi
 
 echo
 echo "-- Kubernetes version --"
-$K version -o json 2>/dev/null | grep -E '"gitVersion"' | tail -1
+if tp_read "the Kubernetes version" "$TP_RD/tp-ver.$TP_RUN" $K version -o json; then
+  _ver=$(grep -E '"gitVersion"' "$TP_RD/tp-ver.$TP_RUN" | tail -1)
+  if [ -n "$_ver" ]; then echo "$_ver"; else
+    tp_note_unread "the Kubernetes version" "no gitVersion in the answer"
+    echo "   unknown: the Kubernetes version could not be read (the answer carried no gitVersion)."; fi
+fi
+rm -f "$TP_RD/tp-ver.$TP_RUN"
 echo "   1.29 is the floor for live-sync: the sidecar is a native sidecar"
 echo "   (initContainer with restartPolicy: Always), absent below it."
 
@@ -694,7 +827,7 @@ if $TP_T_CRD; then
   [ "$TP_T_ORCH_RC" -ne 0 ] && TP_T_ORCH_WHY=$(tp_t_why)
 fi
 # One sentence for "could not read", with the reason when kubectl gave one.
-tp_t_unread() { if [ -n "$2" ]; then echo "   $1 unknown: $3 could not be read ($2)."; else echo "   $1 unknown: $3 could not be read."; fi; }
+tp_t_unread() { tp_note_unread "$3" "${2:-no reason given}"; if [ -n "$2" ]; then echo "   $1 unknown: $3 could not be read ($2)."; else echo "   $1 unknown: $3 could not be read."; fi; }
 if [ -n "$TP_T_ORCH" ] || [ -n "$TP_T_CONTROLLER" ]; then
   echo "   TRIDENT IS INSTALLED"
   if [ -n "$TP_T_CONTROLLER" ]; then
@@ -753,7 +886,11 @@ echo "   Qtree import is Tech Preview from 26.06. Below that an"
 echo "   ontap-nas-economy destination cannot be adopted."
 echo
 echo "-- Nodes --"
-$K get nodes -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory --no-headers 2>/dev/null | sed 's/^/   /'
+if tp_read "the node list" "$TP_RD/tp-nodes.$TP_RUN" $K get nodes -o custom-columns=NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory --no-headers; then
+  if [ -s "$TP_RD/tp-nodes.$TP_RUN" ]; then sed 's/^/   /' "$TP_RD/tp-nodes.$TP_RUN"
+  else echo "   the API answered and listed no nodes"; fi
+fi
+rm -f "$TP_RD/tp-nodes.$TP_RUN"
 echo "-- Node load (for concurrency) --"
 if [ "$K" = oc ]; then oc adm top nodes 2>&1; else $K top nodes 2>&1; fi | sed 's/^/   /' | head -6
 echo "   If that failed there is no metrics-server: concurrency becomes an"
@@ -775,15 +912,16 @@ else
   TP_NM_DIR=$(mktemp -d 2>/dev/null || echo "")
   TP_NM_NODES_OK=0; TP_NM_PODS_OK=0; TP_NM_METRICS_OK=0
   if [ -n "$TP_NM_DIR" ]; then
-    $K get nodes -o json >"$TP_NM_DIR/nodes" 2>/dev/null && TP_NM_NODES_OK=1
-    $K get pods -A -o json >"$TP_NM_DIR/pods" 2>/dev/null && TP_NM_PODS_OK=1
-    $K get --raw /apis/metrics.k8s.io/v1beta1/nodes >"$TP_NM_DIR/metrics" 2>/dev/null \
+    TP_RD_QUIET=1 tp_read "the node documents" "$TP_NM_DIR/nodes" $K get nodes -o json && TP_NM_NODES_OK=1
+    [ "$TP_NM_NODES_OK" = 1 ] || TP_NM_WHY=$(tail -n 1 "$TP_UNREAD_LOG" | cut -f2)
+    TP_RD_QUIET=1 tp_read "the pod list (cluster-wide)" "$TP_NM_DIR/pods" $K get pods -A -o json && TP_NM_PODS_OK=1
+    TP_RD_QUIET=1 tp_read "the node metrics" "$TP_NM_DIR/metrics" $K get --raw /apis/metrics.k8s.io/v1beta1/nodes \
       && jq -e '(.items // []) | length > 0' "$TP_NM_DIR/metrics" >/dev/null 2>&1 && TP_NM_METRICS_OK=1
     [ "$TP_NM_PODS_OK" = 1 ] || echo '{"items":[]}' >"$TP_NM_DIR/pods"
     [ "$TP_NM_METRICS_OK" = 1 ] || echo '{"items":[]}' >"$TP_NM_DIR/metrics"
   fi
   if [ "$TP_NM_NODES_OK" != 1 ]; then
-    echo "   unknown: the nodes could not be read."
+    echo "   unknown: the nodes could not be read${TP_NM_WHY:+ ($TP_NM_WHY)}."
   else
     echo "   XCP starts with ${TP_XCP_MIN_MIB} MiB free on the node. One copier takes about ${TP_XCP_COPIER_MIB} MiB and a verify about ${TP_XCP_VERIFY_MIB} MiB."
     jq -r --slurpfile pods "$TP_NM_DIR/pods" --slurpfile met "$TP_NM_DIR/metrics" \
@@ -880,17 +1018,17 @@ echo "   reason that belongs to the wait."
 sec "B. WHAT EXISTS TODAY — the source side"
 
 echo "-- StorageClasses --"
-$K get sc -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,BINDING:.volumeBindingMode --no-headers 2>/dev/null | sed 's/^/   /'
+tp_show "the StorageClass list" $K get sc -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner,RECLAIM:.reclaimPolicy,BINDING:.volumeBindingMode --no-headers
 
 echo
 echo "-- Trident backends: where the array is, which SVM, which driver --"
 echo "   (a backend made with tridentctl has NO tbc; that is normal)"
-$K get tbc -n trident -o custom-columns=NAME:.metadata.name,BACKEND:.spec.backendName,DRIVER:.spec.storageDriverName,SVM:.spec.svm,MGMT:.spec.managementLIF,DATA:.spec.dataLIF,PREFIX:.spec.storagePrefix,SECRET:.spec.credentials.name --no-headers 2>/dev/null | sed 's/^/   /'
-$K get tbe -n trident -o custom-columns=NAME:.metadata.name,BACKEND:.backendName,STATE:.state,ONLINE:.online --no-headers 2>/dev/null | sed 's/^/   /'
+tp_show "the TridentBackendConfig list" $K get tbc -n trident -o custom-columns=NAME:.metadata.name,BACKEND:.spec.backendName,DRIVER:.spec.storageDriverName,SVM:.spec.svm,MGMT:.spec.managementLIF,DATA:.spec.dataLIF,PREFIX:.spec.storagePrefix,SECRET:.spec.credentials.name --no-headers
+tp_show "the TridentBackend list" $K get tbe -n trident -o custom-columns=NAME:.metadata.name,BACKEND:.backendName,STATE:.state,ONLINE:.online --no-headers
 echo "   Anything but online provisions nothing, and the failure shows up on"
 echo "   a PVC stuck Pending rather than on the backend."
-$K exec -n trident deploy/trident-controller -c trident-main -- tridentctl get backend -o json 2>/dev/null \
-  | { $HAVE_JQ && jq -r '.items[]? |
+if tp_read "the tridentctl backend list" "$TP_RD/tp-tctl.$TP_RUN" $K exec -n trident deploy/trident-controller -c trident-main -- tridentctl get backend -o json; then
+{ $HAVE_JQ && jq -r '.items[]? |
         # tridentctl nests everything under .config and spells the driver
         # differently from the TBC. Reading the TBC key here printed a null
         # driver and an empty object for the prefix on a real cluster.
@@ -899,16 +1037,21 @@ $K exec -n trident deploy/trident-controller -c trident-main -- tridentctl get b
         "\tmgmt=\(.config.managementLIF // "-")" +
         "\tdata=\(.config.dataLIF // "-")" +
         "\tprefix=\(if (.config.storagePrefix|type) == "string" then .config.storagePrefix else "-" end)"' \
-      || cat; } 2>/dev/null
+      || cat; } 2>/dev/null < "$TP_RD/tp-tctl.$TP_RUN"
+fi
+rm -f "$TP_RD/tp-tctl.$TP_RUN"
 
 # The prefix decides whether a NEW backend collides with this one, and
 # neither the TBC nor tridentctl reported it as a string on a real cluster —
 # both printed an empty object. It is in plain sight in the internal names,
 # so it is derived rather than reported as absent.
 if $HAVE_JQ; then
-  DERIVED=$($K get tridentvolumes -n trident -o json 2>/dev/null \
-    | jq -r '[.items[]? | .config.internalName // ""
-              | capture("^(?<p>.*?)pvc_") | .p] | unique | .[]' 2>/dev/null)
+  DERIVED=""
+  if tp_read "the TridentVolume documents (prefixes in use)" "$TP_RD/tp-dv.$TP_RUN" $K get tridentvolumes -n trident -o json; then
+    DERIVED=$(jq -r '[.items[]? | .config.internalName // ""
+              | capture("^(?<p>.*?)pvc_") | .p] | unique | .[]' < "$TP_RD/tp-dv.$TP_RUN" 2>/dev/null)
+  fi
+  rm -f "$TP_RD/tp-dv.$TP_RUN"
   [ -n "$DERIVED" ] && {
     echo "   prefixes actually in use, read from the volume names:"
     echo "$DERIVED" | sed 's/^/     /'
@@ -921,8 +1064,7 @@ echo "-- Every CSI driver installed, and how it treats ownership --"
 # let the kubelet chown the volume, so file ownership is whatever the copy
 # wrote — and a copy that ran as the wrong uid produces an application that
 # starts and cannot read its own data.
-$K get csidrivers -o custom-columns=NAME:.metadata.name,ATTACH:.spec.attachRequired,FSGROUP:.spec.fsGroupPolicy --no-headers 2>/dev/null | sed 's/^/   /' \
-  || echo "   could not list csidrivers"
+tp_show "the CSIDriver list" $K get csidrivers -o custom-columns=NAME:.metadata.name,ATTACH:.spec.attachRequired,FSGROUP:.spec.fsGroupPolicy --no-headers
 echo "   A provisioner here with no StorageClass above it is a driver"
 echo "   somebody installed and nothing uses. A StorageClass whose"
 echo "   provisioner is NOT here provisions nothing at all."
@@ -936,10 +1078,14 @@ echo "   provisioner is NOT here provisions nothing at all."
 # iSCSI from the guest — and neither takes a PVSCSI slot; the source is
 # already attached and the copy pod mounts that same claim. What this says is
 # how much room the estate has, which decides where anything can be placed.
-if $K get csidrivers -o name 2>/dev/null | grep -q "csi.vsphere.vmware.com"; then
+TP_RD_QUIET=1 tp_read "the CSIDriver names (vSphere check)" "$TP_RD/tp-csin.$TP_RUN" $K get csidrivers -o name
+if grep -q "csi.vsphere.vmware.com" "$TP_RD/tp-csin.$TP_RUN" 2>/dev/null; then
   echo
   echo "-- vSphere CSI: volumes attached per node (limit 59) --"
-  $K get volumeattachment -o json 2>/dev/null | python3 -c '
+  if ! tp_read "the VolumeAttachment list" "$TP_RD/tp-va.$TP_RUN" $K get volumeattachment -o json; then
+    echo "   The attached count per node was not computed."
+  else
+  python3 -c '
 import json, sys, collections
 try:
     items = json.load(sys.stdin).get("items", [])
@@ -964,24 +1110,37 @@ else:
         elif room <= 10:
             flag = "   <- %d left" % room
         print("   %-42s %2d/59%s" % (node, n, flag))
-' || echo "   could not count"
+' < "$TP_RD/tp-va.$TP_RUN" || { tp_note_unread "the VolumeAttachment list" "could not be parsed"; echo "   unknown: the VolumeAttachment list could not be parsed."; }
+  fi
+  rm -f "$TP_RD/tp-va.$TP_RUN"
   echo "   A node at 59 takes no more vSphere volumes, and the pod that"
   echo "   wanted one stays Pending saying nothing about controllers."
 fi
 
 echo
 echo "-- Snapshot support --"
-$K get volumesnapshotclass -o custom-columns=NAME:.metadata.name,DRIVER:.driver --no-headers 2>/dev/null | sed 's/^/   /' \
-  || echo "   none — the snapshot mode is unavailable"
-echo -n "   may create volumesnapshots: "; $K auth can-i create volumesnapshots 2>&1 | head -1
+tp_show "the VolumeSnapshotClass list" $K get volumesnapshotclass -o custom-columns=NAME:.metadata.name,DRIVER:.driver --no-headers
+case $? in
+  0) ;;
+  2) echo "   none — the snapshot mode is unavailable (this cluster has no VolumeSnapshotClass type)" ;;
+esac
+echo "   may create volumesnapshots: $(tp_can_i "the permission to create volumesnapshots" create volumesnapshots)"
 echo "   Present, absent and FORBIDDEN are three different answers."
 # VolumeGroupSnapshot: crash-consistent across every claim in a group, so a
 # namespace of claims can be cut over at one instant instead of one at a
 # time. GA in Kubernetes 1.36. It only helps when EVERY claim in the
 # namespace has a class registered for its driver — one that has not is one
 # that cuts over separately, and then the group was not consistent after all.
-VGS=$($K get volumegroupsnapshotclasses -o custom-columns=NAME:.metadata.name,DRIVER:.driver --no-headers 2>/dev/null)
-if [ -n "$VGS" ]; then
+VGS=""; TP_VGS_OK=true
+if tp_read "the VolumeGroupSnapshotClass list" "$TP_RD/tp-vgs.$TP_RUN" $K get volumegroupsnapshotclasses -o custom-columns=NAME:.metadata.name,DRIVER:.driver --no-headers; then
+  VGS=$(cat "$TP_RD/tp-vgs.$TP_RUN")
+else
+  [ $? -eq 2 ] || TP_VGS_OK=false
+fi
+rm -f "$TP_RD/tp-vgs.$TP_RUN"
+if ! $TP_VGS_OK; then
+  :
+elif [ -n "$VGS" ]; then
   echo "   VolumeGroupSnapshotClasses (crash-consistent multi-claim cutover):"
   echo "$VGS" | sed 's/^/     /'
 else
@@ -1015,6 +1174,7 @@ else
       echo absent >"$TP_CEPH_DIR/$TP_CEPH_RES.state"
     else
       echo "unknown $(tail -n 1 "$TP_CEPH_DIR/err" | cut -c1-160)" >"$TP_CEPH_DIR/$TP_CEPH_RES.state"
+      tp_note_unread "the $TP_CEPH_RES list (Ceph topology)" "$(tail -n 1 "$TP_CEPH_DIR/err" | cut -c1-160)"
     fi
   done
   python3 - "$TP_CEPH_DIR" <<'TP_CEPH_PY'
@@ -1510,13 +1670,17 @@ fi
 
 echo
 echo "-- What is on the array behind each claim --"
-$K get tridentvolumes -n trident -o custom-columns=PV:.config.name,INTERNAL:.config.internalName,POOL:.pool,SIZE:.config.size --no-headers 2>/dev/null | sed 's/^/   /' | head -40
+tp_show "the TridentVolume list" $K get tridentvolumes -n trident -o custom-columns=PV:.config.name,INTERNAL:.config.internalName,POOL:.pool,SIZE:.config.size --no-headers | head -40
 echo "   internalName is the FlexVol, qtree or LUN. With the economy drivers"
 echo "   many claims share one FlexVol — and SnapMirror replicates the FlexVol."
 
 # ============================================================================
 sec "C. EVERY NAMESPACE, EVERY CLAIM — the migration proposal"
-echo "  $NS_COUNT namespace(s) hold a persistent volume"
+if [ -n "${TP_NS_UNREAD:-}" ]; then
+  echo "  unknown: which namespaces hold a persistent volume, because the claim list could not be read ($TP_NS_UNREAD)"
+else
+  echo "  $NS_COUNT namespace(s) hold a persistent volume"
+fi
 
 # TridentBackendConfig, read for real : until now this
 # only reached the printed report (section B, "$K get tbc -n trident" above)
@@ -1544,12 +1708,16 @@ TP_SC_TBC_MAP='{}'
 # surface before the migration, not at cutover.
 TP_SC_FSTYPE_MAP='{}'
 if $HAVE_JQ; then
-  TP_SC_JSON=$($K get sc -o json 2>/dev/null)
-  TP_TBC_DRIVER_MAP=$($K get tridentbackendconfigs.trident.netapp.io -A -o json 2>/dev/null | jq -c '
+  TP_SC_JSON=""
+  tp_read "the StorageClass documents (the fsType and backend columns of the CSV are '-' without them)" "$TP_RD/tp-scj.$TP_RUN" $K get sc -o json && TP_SC_JSON=$(cat "$TP_RD/tp-scj.$TP_RUN")
+  rm -f "$TP_RD/tp-scj.$TP_RUN"
+  tp_read "the TridentBackendConfig documents (the backend column of the CSV is '-' without them)" "$TP_RD/tp-tbcj.$TP_RUN" $K get tridentbackendconfigs.trident.netapp.io -A -o json
+  TP_TBC_DRIVER_MAP=$(jq -c '
     ([.items[]? | select(.spec.storageDriverName != null and .spec.backendName != null)]
      | group_by(.spec.storageDriverName)
      | map({(.[0].spec.storageDriverName): ([.[].spec.backendName] | join("|"))})
-     | add) // {}' 2>/dev/null)
+     | add) // {}' "$TP_RD/tp-tbcj.$TP_RUN" 2>/dev/null)
+  rm -f "$TP_RD/tp-tbcj.$TP_RUN"
   [ -z "$TP_TBC_DRIVER_MAP" ] && TP_TBC_DRIVER_MAP='{}'
   TP_SC_TBC_MAP=$(printf '%s' "$TP_SC_JSON" | jq -c --argjson drivers "$TP_TBC_DRIVER_MAP" '
     ([.items[]? | select(.provisioner == "csi.trident.netapp.io") |
@@ -1572,11 +1740,11 @@ for NS in $NAMESPACES; do
   [ -z "$NS" ] && continue
   echo
   echo "── $NS ─────────────────────────────────────────────────────────"
-  $K get pvc -n "$NS" -o custom-columns=NAME:.metadata.name,SC:.spec.storageClassName,MODE:.spec.volumeMode,ACCESS:.spec.accessModes,SIZE:.status.capacity.storage,PHASE:.status.phase --no-headers 2>/dev/null | sed 's/^/   /'
+  tp_show "the claims of namespace $NS" $K get pvc -n "$NS" -o custom-columns=NAME:.metadata.name,SC:.spec.storageClassName,MODE:.spec.volumeMode,ACCESS:.spec.accessModes,SIZE:.status.capacity.storage,PHASE:.status.phase --no-headers
 
   if $HAVE_JQ; then
     echo "   workloads:"
-    $K get deploy,sts,ds -n "$NS" -o json 2>/dev/null > /tmp/tp-w.$$ || true
+    tp_read "the workloads of namespace $NS" /tmp/tp-w.$$ $K get deploy,sts,ds -n "$NS" -o json || true
     jq -r '.items[]? |
       "     \(.kind)/\(.metadata.name)  replicas=\(.spec.replicas // 1)" +
       # Declared is not running. A StatefulSet that says replicas=3 with one
@@ -1596,6 +1764,8 @@ for NS in $NAMESPACES; do
     # the question, and a namespace could be called operator-free here and
     # operator-owned there.
     OPERATOR=$(tp_operator_owners "$NS" /tmp/tp-w.$$ | awk -F'\t' '$3 != "ours"' | sort -u)
+    TP_OWN_WHY=$(tp_owners_why "$NS")
+    [ -n "$TP_OWN_WHY" ] && echo "   unknown: whether an operator owns anything here, because $TP_OWN_WHY."
     [ -n "$OPERATOR" ] && {
       echo "     *** OPERATOR-OWNED: the stop goes through its custom resource ***"
       echo "$OPERATOR" | awk -F'\t' '{printf "       %s/%s   %s\n", $1, $2, $3}'
@@ -1605,7 +1775,7 @@ for NS in $NAMESPACES; do
     # the bare-pod check, the subPath check and the CSV row all ask this same
     # question of the same pods — this used to be four separate `$K get pods`
     # calls per namespace.
-    $K get pods -n "$NS" -o json 2>/dev/null > /tmp/tp-p.$$ || true
+    tp_read "the pods of namespace $NS" /tmp/tp-p.$$ $K get pods -n "$NS" -o json || true
 
     echo "   what mounts what:"
     jq -r '
@@ -1619,7 +1789,9 @@ for NS in $NAMESPACES; do
     # middle of the window, and takes the claim while the copy is running.
     # This is the one class of holder that cannot be found by looking at what
     # is up.
-    SCHEDULED=$($K get cronjob,job -n "$NS" -o json 2>/dev/null | jq -r '
+    SCHEDULED=""
+    tp_read "the CronJobs and Jobs of namespace $NS" /tmp/tp-s.$$ $K get cronjob,job -n "$NS" -o json || echo '{"items":[]}' > /tmp/tp-s.$$
+    SCHEDULED=$(jq -r '
       .items[]? | . as $w
       | ((.spec.jobTemplate.spec.template.spec.volumes // [])
          + (.spec.template.spec.volumes // []))[]
@@ -1627,7 +1799,8 @@ for NS in $NAMESPACES; do
       | "     \(.persistentVolumeClaim.claimName)  <- \($w.kind)/\($w.metadata.name)"
         + (if $w.spec.schedule then "  schedule: \($w.spec.schedule)" else "" end)
         + (if $w.spec.suspend == true then "  (SUSPENDED)" else "" end)' \
-      2>/dev/null | sort -u)
+      /tmp/tp-s.$$ 2>/dev/null | sort -u)
+    rm -f /tmp/tp-s.$$
     [ -n "$SCHEDULED" ] && {
       echo "   *** HOLDS A CLAIM AND IS NOT ALWAYS RUNNING ***"
       echo "$SCHEDULED"
@@ -1678,7 +1851,8 @@ for NS in $NAMESPACES; do
     # fetched below. fsType and annotations: fsType comes from
     # $scfstype, same StorageClass-name lookup pattern as $sctbc above it;
     # annotations reads the same PVC JSON as labels, one line down.
-    $K get pvc -n "$NS" -o json 2>/dev/null | jq -r --arg ns "$NS" \
+    if tp_read "the claim detail of namespace $NS, so no CSV row was written for it" /tmp/tp-c.$$ $K get pvc -n "$NS" -o json; then
+    jq -r --arg ns "$NS" \
       --slurpfile tpw /tmp/tp-w.$$ --slurpfile tpp /tmp/tp-p.$$ \
       --argjson sctbc "$TP_SC_TBC_MAP" --argjson scfstype "$TP_SC_FSTYPE_MAP" '
       # Where a claim is held, and how it would be cut over — checked in
@@ -1737,13 +1911,18 @@ for NS in $NAMESPACES; do
          | if $lbls == "" then "-" else $lbls end ),
        ( (($c.metadata.annotations // {}) | to_entries | map("\(.key)=\(.value)") | join("|")) as $annos
          | if $annos == "" then "-" else $annos end )
-      ] | @csv' >> "$CSV" 2>/dev/null
-    rm -f /tmp/tp-w.$$ /tmp/tp-p.$$
+      ] | @csv' /tmp/tp-c.$$ >> "$CSV" 2>/dev/null
+    fi
+    rm -f /tmp/tp-w.$$ /tmp/tp-p.$$ /tmp/tp-c.$$
   fi
 
   # Leftovers from an earlier attempt: a -tp-dest claim means a run started
   # and did not finish, and discovery excludes them as sources.
-  LEFT=$($K get pvc -n "$NS" --no-headers 2>/dev/null | grep -c -- '-tp-dest' || true)
+  LEFT=0
+  if tp_read "the claims of namespace $NS (leftover check)" "$TP_RD/tp-left.$TP_RUN" $K get pvc -n "$NS" --no-headers; then
+    LEFT=$(grep -c -- '-tp-dest' "$TP_RD/tp-left.$TP_RUN" || true)
+  fi
+  rm -f "$TP_RD/tp-left.$TP_RUN"
   [ "${LEFT:-0}" != "0" ] && echo "   *** ${LEFT} leftover -tp-dest claim(s) from an unfinished run ***"
 done
 
@@ -1751,11 +1930,18 @@ done
 sec "D. WHAT WOULD FIGHT BACK"
 
 echo "-- GitOps --"
-$K get applications.argoproj.io -A -o json 2>/dev/null | { $HAVE_JQ && jq -r '.items[]? |
-  "   \(.metadata.namespace)/\(.metadata.name)  dest=\(.spec.destination.namespace)  sync=\(.spec.syncPolicy)"' || cat; } 2>/dev/null \
-  || echo "   no Argo CD"
-$K get kustomizations.kustomize.toolkit.fluxcd.io -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,SUSPEND:.spec.suspend 2>/dev/null | sed 's/^/   /' \
-  || echo "   no Flux"
+tp_read "the Argo CD Application list" "$TP_RD/tp-argo.$TP_RUN" $K get applications.argoproj.io -A -o json
+case $? in
+  0) if $HAVE_JQ; then
+       jq -r '.items[]? |
+  "   \(.metadata.namespace)/\(.metadata.name)  dest=\(.spec.destination.namespace)  sync=\(.spec.syncPolicy)"' "$TP_RD/tp-argo.$TP_RUN" 2>/dev/null \
+         || { tp_note_unread "the Argo CD Application list" "jq could not parse it"; echo "   unknown: the Argo CD Application list could not be parsed."; }
+     else cat "$TP_RD/tp-argo.$TP_RUN"; fi ;;
+  2) echo "   no Argo CD" ;;
+esac
+rm -f "$TP_RD/tp-argo.$TP_RUN"
+tp_show "the Flux Kustomization list" $K get kustomizations.kustomize.toolkit.fluxcd.io -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,SUSPEND:.spec.suspend
+[ $? -eq 2 ] && echo "   no Flux"
 echo "   'automated: {}' — an EMPTY dict — IS auto-sync. The key is the"
 echo "   switch, not its contents, which is why the whole syncPolicy prints."
 echo
@@ -1766,12 +1952,25 @@ echo "-- Anything that owns or re-creates a claim (provisioner-agnostic) --"
 echo "   It does not matter whether it is a database operator, a KubeVirt VM,"
 echo "   a Harvester VM or something we have never seen. What matters is that"
 echo "   a controller references the claim and will put back what we change."
-for R in $($K api-resources --namespaced=true --verbs=list -o name 2>/dev/null \
+TP_SWEEP_RES=""; TP_SWEEP_BAD=""
+if tp_read "the list of resource types (for the sweep of controllers that reference a claim)" "$TP_RD/tp-apires.$TP_RUN" $K api-resources --namespaced=true --verbs=list -o name; then
+  TP_SWEEP_RES=$(cat "$TP_RD/tp-apires.$TP_RUN")
+fi
+rm -f "$TP_RD/tp-apires.$TP_RUN"
+for R in $(printf '%s\n' "$TP_SWEEP_RES" \
            | grep -vE '^(pods|events|endpoints|configmaps|secrets|serviceaccounts|services|controllerrevisions\.apps|endpointslices\.discovery\.k8s\.io|leases\.coordination\.k8s\.io|persistentvolumeclaims|replicasets\.apps|deployments\.apps|statefulsets\.apps|daemonsets\.apps)$'); do
-  HITS=$($K get "$R" -A -o json 2>/dev/null \
-         | grep -oE '"(claimName|persistentVolumeClaimName)": *"[^"]+"' | sort -u | head -6)
-  [ -n "$HITS" ] && echo "   $R -> $(echo "$HITS" | tr '\n' ' ')"
+  if TP_RD_QUIET=1 tp_read "the $R list (sweep for controllers that reference a claim)" "$TP_RD/tp-sweep.$TP_RUN" $K get "$R" -A -o json; then
+    HITS=$(grep -oE '"(claimName|persistentVolumeClaimName)": *"[^"]+"' "$TP_RD/tp-sweep.$TP_RUN" | sort -u | head -6)
+    [ -n "$HITS" ] && echo "   $R -> $(echo "$HITS" | tr '\n' ' ')"
+  elif [ $? -eq 1 ]; then
+    TP_SWEEP_BAD="$TP_SWEEP_BAD $R"
+  fi
+  rm -f "$TP_RD/tp-sweep.$TP_RUN"
 done
+if [ -n "$TP_SWEEP_BAD" ]; then
+  echo "   unknown: these resource types could not be read, so nothing is known about what they reference:"
+  echo "  $TP_SWEEP_BAD" | fold -s -w 90 | sed 's/^/   /'
+fi
 echo "   (the migration's own migrate-*/validate-* Jobs appear here if a run"
 echo "    has already happened; they are not a finding)"
 
@@ -1783,14 +1982,26 @@ echo "-- Virtual machine disks --"
 # the populatedFor annotation is right. Stop the VM, delete the DataVolume
 # with --cascade=orphan, recreate the claim — in that order. None of that
 # looks like scaling a Deployment, so a VM found late is a wave replanned.
-if $K get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
+TP_VMCRD_RC=0
+TP_RD_QUIET=1 tp_read "the VirtualMachine CRD" "$TP_RD/tp-vmcrd.$TP_RUN" $K get crd virtualmachines.kubevirt.io || TP_VMCRD_RC=$?
+rm -f "$TP_RD/tp-vmcrd.$TP_RUN"
+if [ "$TP_VMCRD_RC" -eq 1 ]; then
+  echo "   unknown: whether KubeVirt is installed, because its CRD could not be read ($(tail -n 1 "$TP_UNREAD_LOG" | cut -f2))."
+elif [ "$TP_VMCRD_RC" -eq 0 ]; then
   # The state is status.printableStatus (Running, Stopped, Paused, Migrating...)
   # and not spec.running: a VM driven by spec.runStrategy, which is what
   # OpenShift Virtualization writes, has no spec.running and printed <none>.
   # A VM whose status is absent says "unknown" — an empty field is not a state.
-  VMS=$($K get vm -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.printableStatus 2>/dev/null \
-        | sed -E 's/<none>[[:space:]]*$/unknown/')
-  if [ -n "$VMS" ]; then
+  VMS=""; TP_VMS_OK=true
+  if tp_read "the VirtualMachine list" "$TP_RD/tp-vms.$TP_RUN" $K get vm -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,STATUS:.status.printableStatus; then
+    VMS=$(sed -E 's/<none>[[:space:]]*$/unknown/' "$TP_RD/tp-vms.$TP_RUN")
+  else
+    TP_VMS_OK=false
+  fi
+  rm -f "$TP_RD/tp-vms.$TP_RUN"
+  if ! $TP_VMS_OK; then
+    :
+  elif [ -n "$VMS" ]; then
     echo "$VMS" | sed 's/^/   /'
     echo "   Each of these is its own cutover procedure. Confirm whether"
     echo "   their disks are DataVolumes (CDI) or plain claims."
@@ -1809,13 +2020,18 @@ echo "-- Holders that are not running right now, cluster-wide --"
 # has none. Across 150 namespaces that silence is unreadable: it looks
 # identical to not having looked. So state the cluster-wide count once.
 if $HAVE_JQ; then
-  SCHED_ALL=$($K get cronjob,job -A -o json 2>/dev/null | jq -r '
+  TP_SCHED_OK=true
+  tp_read "the CronJob and Job list (cluster-wide)" "$TP_RD/tp-sched.$TP_RUN" $K get cronjob,job -A -o json || TP_SCHED_OK=false
+  SCHED_ALL=$(jq -r '
     [.items[]? | . as $w
      | ((.spec.jobTemplate.spec.template.spec.volumes // [])
         + (.spec.template.spec.volumes // []))[]
      | select(.persistentVolumeClaim)
-     | "\($w.metadata.namespace)/\($w.kind)/\($w.metadata.name)"] | unique | .[]')
-  if [ -n "$SCHED_ALL" ]; then
+     | "\($w.metadata.namespace)/\($w.kind)/\($w.metadata.name)"] | unique | .[]' "$TP_RD/tp-sched.$TP_RUN" 2>/dev/null)
+  rm -f "$TP_RD/tp-sched.$TP_RUN"
+  if ! $TP_SCHED_OK; then
+    echo "   NOT CHECKED. Do not read this as 'none'."
+  elif [ -n "$SCHED_ALL" ]; then
     echo "$SCHED_ALL" | sed 's/^/   /'
     echo "   Suspend these before the window. A CronJob that fires during the"
     echo "   copy takes the claim from under it, and between firings there is"
@@ -1835,11 +2051,13 @@ echo "-- OPERATORS: what owns the workloads, and do we have a stop for it --"
 # ownerReference, and where there is none the label conventions the product's
 # own registry records, with the custom resource confirmed to exist.
 if $HAVE_JQ; then
-  FOUND=""; UNCLAIMED_ALL=""
+  FOUND=""; UNCLAIMED_ALL=""; TP_OWNERS_UNREAD=""
   for NS in $NAMESPACES; do
     [ -z "$NS" ] && continue
     OWNERS=$(tp_operator_owners "$NS" | awk -v ns="$NS" -F'\t' \
              '{printf "%s\t%s\t%s\t%s\n", ns, $1, $2, $3}')
+    TP_OWN_WHY=$(tp_owners_why "$NS")
+    [ -n "$TP_OWN_WHY" ] && TP_OWNERS_UNREAD="$TP_OWNERS_UNREAD   $NS: $TP_OWN_WHY"$'\n'
     [ -n "$OWNERS" ] && FOUND="$FOUND$OWNERS"$'\n'
     # And the operators that own only workloads with no claim, so the report
     # can say what it left out instead of leaving the reader to wonder.
@@ -1874,7 +2092,15 @@ if $HAVE_JQ; then
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NS" "$KIND" "$NAME" "$HOW" \
       "$(tp_stop_strategy "$KIND" "${OTHER_N:-0}")" "${OTHER_N:-0}"
   done)
-  if [ -z "$THEIRS" ]; then
+  if [ -n "$TP_OWNERS_UNREAD" ]; then
+    echo "   unknown: the operators of these namespaces could not be worked out, so a namespace"
+    echo "   missing from the list below is not known to be operator-free:"
+    printf '%s' "$TP_OWNERS_UNREAD"
+    echo
+  fi
+  if [ -z "$THEIRS" ] && [ -n "$TP_OWNERS_UNREAD" ]; then
+    echo "   no operator was found in the namespaces that could be read."
+  elif [ -z "$THEIRS" ]; then
     echo "   none — every workload holding a claim is a plain Deployment,"
     echo "   StatefulSet or DaemonSet, so stopping is a scale to zero."
   else
@@ -1913,8 +2139,16 @@ if $HAVE_JQ; then
           if echo "$KIND" | grep -qE "^($TP_REFUSES_ZERO)$"; then
             echo "                  *** ITS CUSTOM RESOURCE REFUSES ZERO ***"
             echo "                  Its CRD declares a minimum above zero, so"
-            echo "                  there is no patch that stops it. Measured:"
-            echo "                  CockroachDB's declares minimum 3."
+            echo "                  there is no patch that stops it."
+            case "$KIND" in
+              CrdbCluster|crdbcluster)
+                echo "                  Measured: CockroachDB's declares minimum 3." ;;
+              KafkaNodePool|kafkanodepool)
+                echo "                  $KIND belongs to the Strimzi Kafka operator." ;;
+              *)
+                echo "                  $KIND is one of the kinds the product records as"
+                echo "                  refusing zero." ;;
+            esac
           else
             echo "                  *** NO STOP KNOWN FOR THIS KIND ***"
             echo "                  Nothing here knows which field its custom"
@@ -1969,7 +2203,12 @@ fi
 
 echo
 echo "-- PodSecurity, which can refuse a root container on its own --"
-$K get ns -o custom-columns=NAME:.metadata.name,ENFORCE:.metadata.labels.pod-security\\.kubernetes\\.io/enforce --no-headers 2>/dev/null | grep -vE '<none>$' | sed 's/^/   /' || echo "   none set"
+if tp_read "the namespace list (PodSecurity labels)" "$TP_RD/tp-psa.$TP_RUN" $K get ns -o custom-columns=NAME:.metadata.name,ENFORCE:.metadata.labels.pod-security\\.kubernetes\\.io/enforce --no-headers; then
+  TP_PSA=$(grep -vE '<none>$' "$TP_RD/tp-psa.$TP_RUN")
+  if [ -n "$TP_PSA" ]; then printf '%s\n' "$TP_PSA" | sed 's/^/   /'
+  else echo "   none set"; fi
+fi
+rm -f "$TP_RD/tp-psa.$TP_RUN"
 
 if [ "$K" = "oc" ]; then
   echo
@@ -1989,8 +2228,12 @@ fi
 # ============================================================================
 sec "E. TOTALS — what the destination has to be sized against"
 
-if $HAVE_JQ; then
-  $K get pvc -A -o json 2>/dev/null | jq -r '
+TP_PVC_ALL="$TP_RD/tp-allpvc.$TP_RUN"; TP_PVC_ALL_OK=false
+$HAVE_JQ && tp_read "the claim list (cluster-wide totals)" "$TP_PVC_ALL" $K get pvc -A -o json && TP_PVC_ALL_OK=true
+if $HAVE_JQ && ! $TP_PVC_ALL_OK; then
+  echo "   The totals below were not computed. A total of 0 would be a statement about the cluster, and this is not one."
+elif $HAVE_JQ; then
+  jq -r '
     [.items[]? | {
        sc: (.spec.storageClassName // "-"),
        mode: (.spec.volumeMode // "Filesystem"),
@@ -2033,7 +2276,7 @@ if $HAVE_JQ; then
                "     behind it. Whatever it was meant to serve is not being",
                "     served today — a finding about their CURRENT estate,",
                "     before anyone migrates anything."]) | .[]
-         else empty end)' 2>/dev/null
+         else empty end)' 2>/dev/null < "$TP_PVC_ALL" || { tp_note_unread "the claim totals" "jq could not parse the claim list"; echo "   unknown: the claim list could not be parsed, so no totals are given."; }
 else
   echo "   (needs jq)"
 fi
@@ -2043,8 +2286,8 @@ fi
 # answer to "does it fit" — somebody has to notice, and in front of a
 # customer nobody does.
 TP_BOUND_BYTES=0
-if $HAVE_JQ; then
-  TP_BOUND_BYTES=$($K get pvc -A -o json 2>/dev/null | jq -r '
+if $HAVE_JQ && $TP_PVC_ALL_OK; then
+  TP_BOUND_BYTES=$(jq -r '
     [.items[]? | select(.status.phase == "Bound")
      | ((.status.capacity.storage // "0")
         | capture("(?<n>[0-9.]+)(?<u>[A-Za-z]*)")
@@ -2053,7 +2296,7 @@ if $HAVE_JQ; then
             elif .u == "Gi" then 1073741824 elif .u == "Ti" then 1099511627776
             elif .u == "K"  then 1000 elif .u == "M" then 1000000
             elif .u == "G"  then 1000000000 elif .u == "T" then 1000000000000
-            else 1 end))] | add // 0 | floor' 2>/dev/null)
+            else 1 end))] | add // 0 | floor' 2>/dev/null < "$TP_PVC_ALL")
   [ -n "$TP_BOUND_BYTES" ] || TP_BOUND_BYTES=0
 fi
 
@@ -2513,9 +2756,12 @@ else
   TP_NFS_DIR=$(mktemp -d 2>/dev/null || echo "")
   TP_NFS_ROWS=""
   TP_NFS_OK=0
+  TP_NFS_WHY=""
   if [ -n "$TP_NFS_DIR" ] \
-     && $K get pv -o json >"$TP_NFS_DIR/pv" 2>/dev/null \
-     && $K get sc -o json >"$TP_NFS_DIR/sc" 2>/dev/null; then
+     && { TP_RD_QUIET=1 tp_read "the PersistentVolume list (NFS servers)" "$TP_NFS_DIR/pv" $K get pv -o json \
+          || { TP_NFS_WHY=$(tail -n 1 "$TP_UNREAD_LOG" | cut -f2); false; }; } \
+     && { TP_RD_QUIET=1 tp_read "the StorageClass list (NFS servers)" "$TP_NFS_DIR/sc" $K get sc -o json \
+          || { TP_NFS_WHY=$(tail -n 1 "$TP_UNREAD_LOG" | cut -f2); false; }; }; then
     TP_NFS_OK=1
     TP_NFS_ROWS=$(jq -r --slurpfile sc "$TP_NFS_DIR/sc" '
       ($sc[0].items // []) as $scs
@@ -2540,18 +2786,26 @@ else
             (map(.ns) | unique | length),
             (map(.path) | unique | .[0:4] | join(",")),
             ((map(.pins[]) | unique | join(",")) | if . == "" then "-" else . end) ]
-        | @tsv' "$TP_NFS_DIR/pv" 2>/dev/null)
+        | @tsv' "$TP_NFS_DIR/pv" 2>/dev/null) || {
+      TP_NFS_OK=0; TP_NFS_WHY="jq could not parse the PersistentVolume list"
+      tp_note_unread "the PersistentVolume list (NFS servers)" "$TP_NFS_WHY"; }
   fi
   if [ "$TP_NFS_OK" != 1 ]; then
-    echo "   unknown: the PersistentVolumes or the StorageClasses could not be read."
+    echo "   unknown: the PersistentVolumes or the StorageClasses could not be read${TP_NFS_WHY:+ ($TP_NFS_WHY)}."
   elif [ -z "$TP_NFS_ROWS" ]; then
     echo "   none: no bound PersistentVolume points at an NFS server."
   else
     # Which servers are an ONTAP the script already knows about. First the
     # data LIFs of Trident backends already in the cluster, then, when the
     # array credentials are set, the array itself.
-    TP_NFS_LIFS=$($K get tbc -A -o json 2>/dev/null | jq -r '.items[]? |
-      "\(.spec.dataLIF // "") \(.metadata.name) \(.spec.svm // "-")"' 2>/dev/null)
+    TP_NFS_LIFS=""
+    if tp_read "the TridentBackendConfig list (data LIFs)" "$TP_RD/tp-lifs.$TP_RUN" $K get tbc -A -o json; then
+      TP_NFS_LIFS=$(jq -r '.items[]? |
+      "\(.spec.dataLIF // "") \(.metadata.name) \(.spec.svm // "-")"' < "$TP_RD/tp-lifs.$TP_RUN" 2>/dev/null)
+    else
+      echo "   Servers below are not matched to a Trident data LIF, because that list could not be read."
+    fi
+    rm -f "$TP_RD/tp-lifs.$TP_RUN"
     TP_NFS_TABLE=""
     TP_NFS_N=0
     while IFS=$'\t' read -r SRV NCLAIM NNS EXPORTS PINS; do
@@ -2642,6 +2896,7 @@ sec "G. THE APPLICATIONS, AND WHETHER THE VOLUME HOLDS THEIR DATA"
 #   and where neither is available this says CANNOT SAY, because a volume
 #     nobody could measure must not be reported as a full one.
 TP_BLOB_MARK="@@TP-PRE-BLOB@@"
+TP_UNREAD_MARK="@@TP-PRE-UNREAD@@"
 
 # tp_blob <label> <command...> — run a read, wrapped in a marker line so one
 # python program can be handed a dozen different documents on one stdin
@@ -2649,9 +2904,15 @@ TP_BLOB_MARK="@@TP-PRE-BLOB@@"
 # its own; kubectl's JSON is indented, so no value inside a document can ever
 # be mistaken for one.
 tp_blob() {
-  printf '\n%s %s\n' "$TP_BLOB_MARK" "$1"
-  shift
-  "$@" 2>/dev/null || true
+  _bl=$1; shift
+  printf '\n%s %s\n' "$TP_BLOB_MARK" "$_bl"
+  TP_RD_QUIET=1 tp_read "the $_bl document (section G)" "$TP_RD/tp-blob.$TP_RUN" "$@"; _brc=$?
+  if [ "$_brc" -eq 1 ]; then
+    printf '%s %s\n' "$TP_UNREAD_MARK" "$(tail -n 1 "$TP_UNREAD_LOG" | cut -f2)"
+  elif [ "$_brc" -eq 0 ]; then
+    cat "$TP_RD/tp-blob.$TP_RUN"
+  fi
+  rm -f "$TP_RD/tp-blob.$TP_RUN"
 }
 
 # Trident Protect spells it `exechooks`, Astra Control spelled it
@@ -2659,8 +2920,11 @@ tp_blob() {
 # error rather than an empty list. So the CRDs are discovered first and only
 # what exists is read. `exechooksruns` — the RESULTS of past hook runs — is
 # deliberately not matched: it is history, and this is about what is defined.
-TP_HOOK_RESOURCES=$($K api-resources --namespaced=true --verbs=list -o name 2>/dev/null \
-                    | grep -E '^(exechooks|executionhooks)\.' | sort -u)
+TP_HOOK_RESOURCES=""
+if tp_read "the list of resource types (hooks)" "$TP_RD/tp-hookres.$TP_RUN" $K api-resources --namespaced=true --verbs=list -o name; then
+  TP_HOOK_RESOURCES=$(grep -E '^(exechooks|executionhooks)\.' "$TP_RD/tp-hookres.$TP_RUN" | sort -u)
+fi
+rm -f "$TP_RD/tp-hookres.$TP_RUN"
 
 # The nodes worth asking the kubelet about: the ones running a pod that holds
 # a claim. Asking every node in a large estate is a lot of calls for nothing.
@@ -2668,7 +2932,14 @@ TP_HOOK_RESOURCES=$($K api-resources --namespaced=true --verbs=list -o name 2>/d
 # Fetched ONCE and kept, because the same document is the input to the section
 # itself. Two `get pods -A` on a large estate is two large documents over the
 # wire to answer one question.
-TP_PODS_JSON=$($K get pods -A -o json 2>/dev/null)
+TP_PODS_JSON=""; TP_PODS_JSON_OK=true
+if TP_RD_QUIET=1 tp_read "the pod list (cluster-wide, for the nodes worth asking the kubelet about)" "$TP_RD/tp-podsall.$TP_RUN" $K get pods -A -o json; then
+  TP_PODS_JSON=$(cat "$TP_RD/tp-podsall.$TP_RUN")
+else
+  TP_PODS_JSON_OK=false
+  echo "   unknown: the pod list could not be read ($(tail -n 1 "$TP_UNREAD_LOG" | cut -f2)), so no node was chosen for the kubelet statistics."
+fi
+rm -f "$TP_RD/tp-podsall.$TP_RUN"
 TP_STAT_NODES=""
 TP_STAT_NODES_ALL=0
 if $HAVE_JQ; then
@@ -2702,7 +2973,7 @@ tp_ontap_volumes() {
 #   may read the kubelet's own volume statistics: Warning: resource ...
 # which is neither yes nor no.
 echo -n "   may read the kubelet's own volume statistics: "
-$K auth can-i get nodes/proxy 2>/dev/null | head -1 || echo "no"
+tp_can_i "the permission to read nodes/proxy" get nodes/proxy
 echo "   That read is what gives a used size per claim without entering any"
 echo "   container. If it says no, the used sizes below come from the array or"
 echo "   not at all — and 'not at all' is printed as CANNOT SAY, never as 0."
@@ -2730,6 +3001,8 @@ import sys
 import time
 
 MARK = "@@TP-PRE-BLOB@@"
+UNREAD_MARK = "@@TP-PRE-UNREAD@@"
+UNREAD = {}
 MIB = 1024.0 * 1024.0
 GIB = MIB * 1024.0
 
@@ -2758,6 +3031,8 @@ def blobs():
             if label is not None:
                 out.setdefault(label, []).append("\n".join(buf))
             label, buf = line[len(MARK):].strip(), []
+        elif line.startswith(UNREAD_MARK):
+            UNREAD[label] = line[len(UNREAD_MARK):].strip()
         elif label is not None:
             buf.append(line)
     if label is not None:
@@ -2939,6 +3214,11 @@ def persistence_switched_off(container):
 # traceback into the middle of a customer's report, and so that a reader can
 # always tell "this did not run" from "there was nothing to say".
 def report():
+
+    for _label in sorted(UNREAD):
+        print("   unknown: the %s read could not be made (%s), so everything in this section"
+              % (_label, UNREAD[_label] or "no reason given"))
+        print("   that depends on it was worked out from an empty answer and is not a finding.")
 
     # ── what the cluster said ───────────────────────────────────────────────────
     PODS = []
@@ -5571,9 +5851,14 @@ echo "   privileged: the same kind of read-only exec section F already"
 echo "   performs against the controller. Nothing new is created."
 
 TP_H_NS="${TRIDENT_NS:-trident}"
-TP_H_PODS=$($K get pods -n "$TP_H_NS" -l app=node.csi.trident.netapp.io \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}{.status.phase}{"\n"}{end}' \
-  2>/dev/null)
+TP_H_PODS=""
+if tp_read "the Trident node pods" "$TP_RD/tp-hpods.$TP_RUN" $K get pods -n "$TP_H_NS" -l app=node.csi.trident.netapp.io \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\t"}{.status.phase}{"\n"}{end}'; then
+  TP_H_PODS=$(cat "$TP_RD/tp-hpods.$TP_RUN")
+else
+  echo "   The nodes were not asked."
+fi
+rm -f "$TP_RD/tp-hpods.$TP_RUN"
 
 if [ -z "$TP_H_PODS" ]; then
   echo "   NOT CHECKED — no Trident node pod found (label"
@@ -5613,9 +5898,11 @@ else
     TP_H_RAW=$(tp_block_mirror_probe "$TP_H_NS" "$TP_H_POD" trident-main "$TP_H_NODE")
     if [ -z "$TP_H_RAW" ]; then
       printf '   %-40s UNKNOWN — the node pod did not answer\n' "$TP_H_NODE"
+      tp_note_unread "the block-mirror probe on node $TP_H_NODE" "the node pod did not answer"
       TP_H_UNKNOWN=$((TP_H_UNKNOWN + 1))
     elif echo "$TP_H_RAW" | grep -q 'nosh=unreadable'; then
       printf '   %-40s UNKNOWN — the node pod has no shell to read with\n' "$TP_H_NODE"
+      tp_note_unread "the block-mirror probe on node $TP_H_NODE" "the node pod has no shell"
       TP_H_UNKNOWN=$((TP_H_UNKNOWN + 1))
       TP_H_NEEDS_DEBUG=yes
     elif echo "$TP_H_RAW" | grep -qE 'loaded=yes|present=yes'; then
@@ -5623,6 +5910,7 @@ else
       TP_H_YES=$((TP_H_YES + 1))
     elif echo "$TP_H_RAW" | grep -q 'present=unknown'; then
       printf '   %-40s UNKNOWN — not loaded now; the node pod cannot look further\n' "$TP_H_NODE"
+      tp_note_unread "the block-mirror probe on node $TP_H_NODE" "not loaded now and the node pod cannot look further"
       TP_H_UNKNOWN=$((TP_H_UNKNOWN + 1))
     else
       printf '   %-40s not available\n' "$TP_H_NODE"
@@ -5711,6 +5999,7 @@ else
     TP_I_RC=$?
     if [ "$TP_I_RC" -ne 0 ]; then
       printf "   %-40s UNKNOWN -- could not read this pod's own spec\n" "$TP_I_NODE"
+      tp_note_unread "the spec of the node pod on $TP_I_NODE" "the read failed"
       TP_I_UNKNOWN=$((TP_I_UNKNOWN + 1))
     elif [ "$TP_I_HOSTPID" != "true" ]; then
       printf "   %-40s hostPID: false -- the /host convention applies normally here\n" "$TP_I_NODE"
@@ -5718,15 +6007,23 @@ else
       TP_I_RAW=$(tp_hostnqn_path_probe "$TP_H_NS" "$TP_I_POD" trident-main)
       if [ -z "$TP_I_RAW" ]; then
         printf "   %-40s UNKNOWN -- hostPID: true, and the node pod did not answer\n" "$TP_I_NODE"
+        tp_note_unread "the hostNQN probe on node $TP_I_NODE" "the node pod did not answer"
         TP_I_UNKNOWN=$((TP_I_UNKNOWN + 1))
       elif echo "$TP_I_RAW" | grep -q 'nosh=unreadable'; then
         # The definitive answer needs no exec: Trident registers the hostNQN
         # it found on the TridentNode of that node.
-        TP_I_NQN=$($K get tridentnodes.trident.netapp.io "$TP_I_NODE" -n "$TP_H_NS" -o jsonpath='{.spec.nqn}' 2>/dev/null)
-        if [ -n "$TP_I_NQN" ]; then
+        TP_I_NQN=""; TP_I_NQN_RC=0
+        TP_RD_QUIET=1 tp_read "the TridentNode of $TP_I_NODE" "$TP_RD/tp-nqn.$TP_RUN" $K get tridentnodes.trident.netapp.io "$TP_I_NODE" -n "$TP_H_NS" -o jsonpath='{.spec.nqn}'
+        TP_I_NQN_RC=$?
+        TP_I_NQN=$(cat "$TP_RD/tp-nqn.$TP_RUN" 2>/dev/null); rm -f "$TP_RD/tp-nqn.$TP_RUN"
+        if [ "$TP_I_NQN_RC" -eq 1 ]; then
+          printf "   %-40s UNKNOWN -- hostPID: true, no shell in the node pod, and the TridentNode could not be read\n" "$TP_I_NODE"
+          TP_I_UNKNOWN=$((TP_I_UNKNOWN + 1))
+        elif [ -n "$TP_I_NQN" ]; then
           printf "   %-40s hostPID: true -- TridentNode.spec.nqn is set; Trident found a hostNQN here\n" "$TP_I_NODE"
         else
           printf "   %-40s UNKNOWN -- hostPID: true, no shell in the node pod, TridentNode.spec.nqn empty or absent\n" "$TP_I_NODE"
+          tp_note_unread "the hostNQN of node $TP_I_NODE" "no shell in the node pod and TridentNode.spec.nqn empty or absent"
           TP_I_UNKNOWN=$((TP_I_UNKNOWN + 1))
         fi
       elif echo "$TP_I_RAW" | grep -q 'nvme_dir=no'; then
@@ -5790,8 +6087,17 @@ if $TP_BENCH; then
     echo "   It needs python3. Install it and run this again."
     TP_BENCH_OK=false
   elif [ -z "$TP_BENCH_DEST" ]; then
-    TP_TR=$($K get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.provisioner}{"\n"}{end}' 2>/dev/null | awk '$2=="csi.trident.netapp.io"{print $1}' | paste -sd, -)
-    if [ -n "$TP_TR" ]; then
+    TP_TR=""; TP_TR_OK=true
+    if tp_read "the StorageClass list (classes served by Trident)" "$TP_RD/tp-trsc.$TP_RUN" $K get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.provisioner}{"\n"}{end}'; then
+      TP_TR=$(awk '$2=="csi.trident.netapp.io"{print $1}' "$TP_RD/tp-trsc.$TP_RUN" | paste -sd, -)
+    else
+      TP_TR_OK=false
+    fi
+    rm -f "$TP_RD/tp-trsc.$TP_RUN"
+    if ! $TP_TR_OK; then
+      echo "   NOT RUN: --bench needs the destination class, and the list of classes could not be read to suggest one."
+      echo "   Run: ./tp-pre.sh --bench --dest-sc <your Trident class>"
+    elif [ -n "$TP_TR" ]; then
       echo "   NOT RUN: --bench needs the destination class. Classes served by Trident here: $TP_TR"
       echo "   Run: ./tp-pre.sh --bench --dest-sc <one of them>"
     else
@@ -5851,6 +6157,15 @@ fi
 
 
 hr
+TP_UNREAD_N=$(tp_unread_count)
+if [ "${TP_UNREAD_N:-0}" -gt 0 ]; then
+  echo "  COULD NOT READ: $TP_UNREAD_N read(s) failed, and each is marked 'unknown' above. They are not 'none' and not 0."
+  echo "  The count covers the reads this script makes of the cluster. It leaves out the node-load line (which prints the command's own message), the array and NFS-server probes, and the machine-readable inventory, which lists its own unreadable sections in its summary."
+  sort -u "$TP_UNREAD_LOG" | cut -c1-200 | sed 's/\t/  --  /; s/^/    /' | head -40
+else
+  echo "  reads that failed: 0   (counts the reads of the cluster made by this script, not the node-load line, the array and NFS-server probes or the machine-readable inventory)"
+fi
+hr
 echo "  report:  $OUT"
 echo "  csv:     $CSV   (one row per claim, for planning waves)"
 [ -f "$INV_JSON" ] && echo "  json:    $INV_JSON   (the raw inventory)"
@@ -5900,8 +6215,10 @@ echo "  this machine is theirs."
 echo "════════════════════════════════════════════════════════════════"
 echo
 echo "-- Every shape in the estate, and what can serve it --"
-if $HAVE_JQ; then
-  $K get pvc -A -o json 2>/dev/null | jq -r '
+if $HAVE_JQ && ! $TP_PVC_ALL_OK; then
+  echo "   unknown: the claim list could not be read (see section E), so no shape is given."
+elif $HAVE_JQ; then
+  jq -r '
     [.items[]? | {
        sc: (.spec.storageClassName // "-"),
        mode: (.spec.volumeMode // "Filesystem"),
@@ -5922,10 +6239,10 @@ if $HAVE_JQ; then
          "ontap-nas   (a shared filesystem; SAN cannot serve it)"
        else
          "ontap-nas or ontap-san   (either serves RWO Filesystem)"
-       end)'
+       end)' < "$TP_PVC_ALL"
   echo
   echo "-- Therefore, the destination classes needed --"
-  $K get pvc -A -o json 2>/dev/null | jq -r '
+  jq -r '
     [.items[]? | {
        sc: (.spec.storageClassName // "-"),
        driver: (if (.spec.volumeMode // "Filesystem") == "Block"
@@ -5941,7 +6258,7 @@ if $HAVE_JQ; then
      }]
     | group_by([.sc, .driver])[]
     | "   from \(.[0].sc)  ->  one \(.[0].driver) class"
-      + "   (\(length) claims, \((map(.bytes) | add) / 1073741824 | floor) GiB)"'
+      + "   (\(length) claims, \((map(.bytes) | add) / 1073741824 | floor) GiB)"' < "$TP_PVC_ALL"
   echo
   echo "   One destination class per (source class, driver) pair. That is what"
   echo "   --sc-map expresses, and it is why they cannot be collapsed: a"
@@ -5973,13 +6290,27 @@ else
 fi
 echo
 echo "-- Prefixes already in use (the new one must not collide) --"
-TP_PFX=$({
-  $K get tbc -n trident -o jsonpath='{range .items[*]}{.spec.storagePrefix}{"\n"}{end}' 2>/dev/null
-  $K exec -n trident deploy/trident-controller -c trident-main -- tridentctl get backend -o json 2>/dev/null \
-    | { $HAVE_JQ && jq -r '.items[]? | select((.config.storagePrefix|type) == "string") | .config.storagePrefix' || true; } 2>/dev/null
-} | sed '/^[[:space:]]*$/d' | sort -u)
-if [ -n "$TP_PFX" ]; then echo "$TP_PFX" | sed 's/^/   /'
-else echo "   (none set; Trident's default applies)"; fi
+TP_PFX=""; TP_PFX_BAD=""
+if tp_read "the TridentBackendConfig list (prefixes)" "$TP_RD/tp-pfx1.$TP_RUN" $K get tbc -n trident -o jsonpath='{range .items[*]}{.spec.storagePrefix}{"\n"}{end}'; then
+  TP_PFX=$(cat "$TP_RD/tp-pfx1.$TP_RUN")
+elif [ $? -eq 1 ]; then
+  TP_PFX_BAD="the TridentBackendConfig list"
+fi
+if tp_read "the tridentctl backend list (prefixes)" "$TP_RD/tp-pfx2.$TP_RUN" $K exec -n trident deploy/trident-controller -c trident-main -- tridentctl get backend -o json; then
+  if $HAVE_JQ; then
+    TP_PFX="$TP_PFX"$'\n'"$(jq -r '.items[]? | select((.config.storagePrefix|type) == "string") | .config.storagePrefix' < "$TP_RD/tp-pfx2.$TP_RUN" 2>/dev/null)"
+  fi
+elif [ $? -eq 1 ]; then
+  TP_PFX_BAD="${TP_PFX_BAD:+$TP_PFX_BAD and }the tridentctl backend list"
+fi
+rm -f "$TP_RD/tp-pfx1.$TP_RUN" "$TP_RD/tp-pfx2.$TP_RUN"
+TP_PFX=$(printf '%s\n' "$TP_PFX" | sed '/^[[:space:]]*$/d' | sort -u)
+if [ -n "$TP_PFX" ]; then echo "$TP_PFX" | sed 's/^/   /'; fi
+if [ -n "$TP_PFX_BAD" ]; then
+  echo "   unknown: $TP_PFX_BAD could not be read, so the prefixes listed above may be incomplete."
+elif [ -z "$TP_PFX" ]; then
+  echo "   (none set; Trident's default applies)"
+fi
 echo
 cat <<'DRAFT'
 -- The drafts --
@@ -6012,3 +6343,4 @@ DRAFT
 echo "════════ END INTERNAL — nothing above this was written down ═════"
 }
 fi
+if [ -n "$TP_RD_DIR" ]; then rm -rf "$TP_RD_DIR"; fi
